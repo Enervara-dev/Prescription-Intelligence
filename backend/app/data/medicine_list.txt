@@ -1,0 +1,324 @@
+Paracetamol
+Dolo
+Crocin
+Calpol
+Ibuprofen
+Brufen
+Combiflam
+Aceclofenac
+Naproxen
+Diclofenac
+Meftal
+Mefenamic Acid
+Etoricoxib
+Indomethacin
+Ketorolac
+Amoxicillin
+Clavulanic Acid
+Augmentin
+Azithromycin
+Cefixime
+Ofloxacin
+Ciprofloxacin
+Doxycycline
+Levofloxacin
+Metronidazole
+Cefuroxime
+Cefpodoxime
+Clarithromycin
+Linezolid
+Roxithromycin
+Amikacin
+Gentamicin
+Meropenem
+Imipenem
+Vancomycin
+Cetirizine
+Levocetirizine
+Loratadine
+Fexofenadine
+Montelukast
+Phenylephrine
+Ambroxol
+Bromhexine
+Chlorpheniramine
+Diphenhydramine
+Codeine
+Dextromethorphan
+Guaifenesin
+Pantoprazole
+Rabeprazole
+Omeprazole
+Esomeprazole
+Lansoprazole
+Ranitidine
+Famotidine
+Domperidone
+Ondansetron
+Itopride
+Sucralfate
+Metformin
+Glimepiride
+Sitagliptin
+Vildagliptin
+Gliclazide
+Pioglitazone
+Insulin
+Teneligliptin
+Amlodipine
+Losartan
+Telmisartan
+Atenolol
+Metoprolol
+Propranolol
+Carvedilol
+Ramipril
+Enalapril
+Clopidogrel
+Aspirin
+Atorvastatin
+Rosuvastatin
+Neurobion
+Becosules
+Zincovit
+Shelcal
+Folvite
+Vitamin D3
+Vitamin B12
+Calcium
+Iron
+Methylcobalamin
+Thiocolchicoside
+Chlorzoxazone
+Tizanidine
+Baclofen
+P-250
+Ibugesic
+Meftal-P
+Zinc Syrup
+Dolo 650
+Crocin Advance
+Augmentin 625
+Azithral
+Ciplox
+Omez
+Pan 40
+Razo
+Glycomet
+Ecosprin
+Fluconazole
+Itraconazole
+Ketoconazole
+Clotrimazole
+Albendazole
+Ivermectin
+Nitazoxanide
+Salbutamol
+Budesonide
+Formoterol
+Montair
+Betnovate
+Candid
+Soframycin
+Mupirocin
+Thyroxine
+Eltroxin
+Alprazolam
+Clonazepam
+Escitalopram
+Sertraline
+Betahistine
+Vestib
+Vertin
+Betavert
+Betaserc
+Stemetil
+Prochlorperazine
+Meclizine
+Pantodac
+Sompraz
+Rabium
+Nexpro
+Pantosec
+Nexito
+Nexitoplus
+Escitalopram
+Fluoxetine
+Paroxetine
+Fluvoxamine
+Amitriptyline
+Nortriptyline
+Clomipramine
+Imipramine
+Mirtazapine
+Venlafaxine
+Duloxetine
+Bupropion
+Trazodone
+Quetiapine
+Risperidone
+Olanzapine
+Haloperidol
+Aripiprazole
+Clozapine
+Amisulpride
+Ziprasidone
+Paliperidone
+Lithium
+Valproate
+Sodium Valproate
+Carbamazepine
+Lamotrigine
+Topiramate
+Levetiracetam
+Phenytoin
+Gabapentin
+Pregabalin
+Diazepam
+Lorazepam
+Clonazepam
+Nitrazepam
+Zolpidem
+Zopiclone
+Melatonin
+Hydroxyzine
+Buspirone
+Rejunex
+Rejunex D3
+Rejunex CD3
+Mecobalamin
+Methylcobalamin
+Nurokind
+Nurokind Plus
+Benfotiamine
+Pyridoxine
+Cyanocobalamin
+Polybion
+Polybion NXT
+Beplex Forte
+Bevitol
+Gaviscon
+Gelusil
+Digene
+Eno
+Maalox
+Mucaine
+Mucogel
+Vozan
+Vomikind
+Emeset
+Ranidom
+Stugeron
+Cinnarizine
+Flunarizine
+Navidoxine
+Vitamin C
+Vitamin E
+Vitamin A
+Vitamin B Complex
+Folic Acid
+Biotin
+Collagen
+Zinc
+Magnesium
+Potassium
+Sodium Chloride
+ORS
+Electral
+Dextrose
+Saline
+Novalgin
+Nimesulide
+Aceclofenac Paracetamol
+Tramadol
+Tapentadol
+Morphine
+Codeine Phosphate
+Azithromycin 500
+Amoxicillin 500
+Ciprofloxacin 500
+Metronidazole 400
+Cefixime 200
+Cefpodoxime 200
+Ofloxacin 200
+Doxycycline 100
+Levofloxacin 500
+Fluconazole 150
+Itraconazole 100
+Ketoconazole 200
+Placidyl
+Placida
+Flupenthixol
+Melitracen
+Deanxit
+Alprax
+Petril
+Riva
+Lonazep
+Zolax
+Nexito Plus
+Stalopam
+Rexipra
+Fluox
+Fludep
+Prozac
+Paxil
+Luvox
+Elavil
+Saroten
+Anafranil
+Tofranil
+Remeron
+Effexor
+Cymbalta
+Wellbutrin
+Seroquel
+Risperdal
+Zyprexa
+Haldol
+Abilify
+Clozaril
+Solian
+Geodon
+Invega
+Eskalith
+Depakote
+Tegretol
+Lamictal
+Topamax
+Keppra
+Dilantin
+Neurontin
+Lyrica
+Valium
+Ativan
+Rivotril
+Dormicum
+Ambien
+Zimovane
+Atarax
+Buspar
+Stugil
+Betahistine Dihydrochloride
+Trimetazidine
+Cinnarizine 25mg
+Prochlorperazine 5mg
+Ondansetron 4mg
+Ondansetron 8mg
+Domperidone 10mg
+Pantoprazole 40mg
+Rabeprazole 20mg
+Esomeprazole 40mg
+Omeprazole 20mg
+Ranitidine 150mg
+Famotidine 20mg
+Sucralfate 1g
+Metoclopramide
+Levosulpiride
+Mosapride
+Acotiamide
+Trimebutine
+Drotaverine
+Hyoscine
+Dicyclomine
+Mebeverine

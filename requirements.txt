@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+easyocr
+pillow
+opencv-python-headless==4.8.1.78
+python-multipart
+numpy<2
+pymupdf
+opencv-python
+rapidfuzz
+sqlalchemy
+sqlmodel
