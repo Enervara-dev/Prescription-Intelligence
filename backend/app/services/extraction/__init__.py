@@ -8,7 +8,10 @@ false-positive suppression, and field extraction (dosage, frequency, duration).
 import re
 import os
 from typing import List, Dict, Any, Optional
+import logging
 from rapidfuzz import process, fuzz
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -82,8 +85,9 @@ SKIP_WORDS = {
     "sign", "signature", "assessment", "record", "nationality", "religion",
     "student", "corporate", "treatment", "investigations", "clinical", "notes",
     "advised", "meditation", "exercises", "fruits", "vegetables", "fibre",
-    "heaviness", "bloating", "nausea", "vomiting", "stools", "loss", "fever",
-    "cough", "review",
+    "heaviness", "bloating", "nausea", "vomiting", "vomitings", "stools", "loss", "fever",
+    "cough", "review", "candida", "effects", "mucas", "mucus", "srivathsa", "rivathsa",
+    "kims", "medical",
 }
 
 
@@ -162,31 +166,38 @@ def _match_medicine(token: str, db: List[str]) -> Optional[Dict[str, Any]]:
             if len(med_base) < 4:
                 continue
 
-            # Length disparity guard
-            if abs(len(var) - len(med_base)) > 4 and min(len(var), len(med_base)) < 6:
+            # Stricter length disparity guard
+            len_diff = abs(len(var) - len(med_base))
+            if len_diff >= 4 and min(len(var), len(med_base)) < 7:
                 continue
 
-            # 1. Levenshtein ratio / WRatio & Token Set Ratio (for multi-word brand matches)
+            # 1. Levenshtein ratio / WRatio & Token Set Ratio
             wr = float(fuzz.WRatio(var, med_base))
             token_ratio = float(fuzz.token_set_ratio(var, med_clean))
-            partial = float(fuzz.partial_ratio(var, med_base)) if len(var) >= 5 and len(med_base) >= 5 else 0.0
 
             # 2. Prefix similarity bonus (first 3-4 letters)
             prefix_len = min(4, len(var), len(med_base))
             prefix_match = (var[:prefix_len] == med_base[:prefix_len])
 
-            score = max(wr, token_ratio, partial * 0.90)
-            if prefix_match and (wr >= 60.0 or token_ratio >= 65.0):
-                score = min(100.0, score + 14.0)
+            score = max(wr, token_ratio)
+            
+            # Penalize length disparities to prevent "rivathsa" matching "riva"
+            if len_diff >= 3:
+                score -= (len_diff * 4)
+                
+            if prefix_match and score >= 70.0:
+                score = min(100.0, score + 10.0)
 
             if score > best_score:
                 best_score = score
                 best_match = med
 
-    if best_score >= 78.0 and best_match:
+    # Increase threshold to 82 to reduce false positives
+    if best_score >= 82.0 and best_match:
         return {"name": best_match, "confidence": round(min(100.0, best_score), 1)}
 
     return None
+
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +280,7 @@ def parse_medicines(text: str) -> List[Dict[str, Any]]:
 
     db = _load_medicine_db()
     lines = text.split("\n") if "\n" in text else _split_into_lines(text)
+
     results = []
     seen_names = set()
 

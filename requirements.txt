@@ -1,6 +1,6 @@
 fastapi
 uvicorn[standard]
-easyocr
+google-cloud-vision
 pillow
 opencv-python-headless==4.8.1.78
 python-multipart
@@ -10,3 +10,5 @@ opencv-python
 rapidfuzz
 sqlalchemy
 sqlmodel
+python-dotenv
+
