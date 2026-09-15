@@ -1,0 +1,7 @@
+-r requirements.txt
+pytest==8.2.0
+
+# fastapi.testclient.TestClient (starlette==0.37.2, resolved from
+# requirements.txt) requires httpx — see requirements.txt for why this
+# exact version/starlette combination is pinned and why httpx is pinned
+# there directly rather than only here.

@@ -1,0 +1,21 @@
+# Local development database for Prescription Intelligence ONLY.
+#
+# This is a dedicated Postgres instance for this service's own `medicines`
+# catalog — deliberately separate from any other application's database.
+# `pg_trgm` (used for indexed fuzzy medicine search) ships with the official
+# postgres image, so no custom image is needed.
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: prescription_intelligence
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - prescription_intelligence_pgdata:/var/lib/postgresql/data
+
+volumes:
+  prescription_intelligence_pgdata:

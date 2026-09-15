@@ -1,0 +1,33 @@
+# Never let real secrets enter the build context, even though the Dockerfile
+# doesn't explicitly COPY these — Google Vision credentials and DATABASE_URL
+# must only ever reach the container via runtime environment variables.
+.env
+.env.*
+!.env.example
+
+# VCS / editor / OS
+.git
+.gitignore
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.mypy_cache/
+.ruff_cache/
+
+# Tests — not needed in the runtime image
+tests/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local dev / docs — not needed in the image
+venv/
+env/
+docker-compose.yml
+README.md
