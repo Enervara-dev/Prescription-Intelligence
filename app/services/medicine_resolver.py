@@ -37,6 +37,59 @@ not something the exact-match stages can paper over (they only ever fire on
 a literal string match), and when the top two candidates are too close, the
 result is REVIEW_REQUIRED rather than a forced pick.
 
+SAFETY RULE (identity corroboration): a high raw fuzzy/trigram string-
+similarity score is NEVER, on its own, sufficient evidence for
+HIGH_CONFIDENCE. Two clinically unrelated medicines can be close as strings
+purely by coincidence (verified: "Asthalin" scores ~69 against "Aspirin"
+with no correction or context involved at all). HIGH_CONFIDENCE from the
+fuzzy stage (stage 7-8) requires one of:
+  (a) the query, or a principled single-character OCR-confusable
+      correction of it, is an EXACT match against a catalog name/alias
+      (see `_exact_after_correction` below) -- this is what legitimizes
+      "D0LO 650" -> "Dolo 650" and "Crocln 650" -> "Crocin 650": a
+      structural, explainable correction landing on a real identity, not
+      mere resemblance; or
+  (b) the query separately stated a strength or dosage form that agrees
+      with this specific candidate (see `_has_identity_corroboration`) --
+      independent evidence beyond string shape alone.
+A candidate meeting neither bar is capped at REVIEW_REQUIRED regardless of
+its numeric score, however high — see `_resolve_normalized`'s fuzzy-stage
+acceptance gate. This is a property of the EVIDENCE the resolver has, not a
+name-specific rule, so it generalizes to any future lookalike pair without
+needing a new special case.
+
+CONFIDENCE SEMANTICS (documented once, here, as the single source of truth
+— every field below is read by multiple call sites; see the module-level
+grep audit in the OCR/matching forensic review for the full consumer list):
+  - `ResolutionResult.confidence` (delegates to `matched.confidence`):
+    0-100. PURE medicine-matching confidence (name similarity + strength/
+    form/source ranking adjustments). Never incorporates OCR read quality.
+    This is the pre-existing, unchanged-meaning compatibility field —
+    consumed by `/api/v1/medicines/resolve`, `/process`'s per-medicine
+    dict, and (divided by 100) Enervara's `/extract` adapter historically.
+  - `ResolutionResult.ocr_confidence` (new, optional): 0.0-1.0, the OCR
+    provider's own certainty about the text span this result was resolved
+    from — set by the caller (see `resolve()`'s new parameter) when that
+    information is available from structured OCR data; `None` when it
+    isn't (e.g. a direct API call with no OCR context), in which case
+    nothing about existing behavior changes.
+  - `ResolutionResult.overall_confidence` (new, computed property): fuses
+    `confidence` with `ocr_confidence` when both are present — a
+    dampening-only combination (never inflates a score), reflecting that a
+    clean-looking match is only as trustworthy as the OCR read it came
+    from. Equals `confidence` exactly when `ocr_confidence` is `None`.
+  - `match_type`: which resolution stage/strategy produced the match
+    (UPPER_SNAKE vocabulary — EXACT_BRAND/EXACT_ALIAS/EXACT_GENERIC/
+    EXACT_GENERIC_RXNORM/EXACT_CATALOG_NAME/OCR_NORMALIZED_*/FUZZY_*).
+    Distinct from, and never mixed with, `medicine_matching.py`'s own
+    lowercase vocabulary for the unrelated `/medicines/search` code path.
+  - `matched`: the ONE candidate a caller should treat as "this is the
+    identified medicine" — populated ONLY for EXACT and (corroborated)
+    HIGH_CONFIDENCE. Never populated for LOW_CONFIDENCE, REVIEW_REQUIRED,
+    or NO_MATCH: a wrong medicine is worse than an unresolved one.
+  - `source`: provenance tag of the matched row (`legacy_manual`/`rxnorm`/
+    etc.), `None` whenever `matched` is `None`.
+
 Note on stages 4-5 (brand + strength): this catalog stores Indian brand
 identity WITH strength baked into `brand_name` (e.g. "Dolo 650", "Pan 40") —
 matching Indian real-world labeling convention — so an exact/fuzzy match on
@@ -94,6 +147,10 @@ class ResolutionResult:
     matched: Optional[ResolvedCandidate] = None
     candidates: list[ResolvedCandidate] = field(default_factory=list)
     latency_ms: float = 0.0
+    # OCR provider's own certainty (0.0-1.0) about the text this was resolved
+    # from, when the caller had structured OCR data to supply it — see the
+    # CONFIDENCE SEMANTICS note in the module docstring. None when unknown.
+    ocr_confidence: Optional[float] = None
 
     @property
     def match_type(self) -> Optional[str]:
@@ -106,6 +163,31 @@ class ResolutionResult:
     @property
     def source(self) -> Optional[str]:
         return self.matched.medicine.source if self.matched else None
+
+    @property
+    def overall_confidence(self) -> Optional[float]:
+        """See `fuse_confidence` — the single source of truth for this
+        formula, also used outside this dataclass (extraction/__init__.py)
+        for per-medicine results built from a matched-and-then-consumed
+        candidate rather than a live ResolutionResult."""
+        return fuse_confidence(self.confidence, self.ocr_confidence)
+
+
+def fuse_confidence(match_confidence: Optional[float], ocr_confidence: Optional[float]) -> Optional[float]:
+    """
+    Fuses match confidence (0-100, pure name/identity evidence) with OCR
+    read confidence (0.0-1.0, the provider's own certainty about the source
+    text) into one combined signal. Dampens only — never inflates a score
+    above what the name-matching evidence alone supports — and is identical
+    to `match_confidence` whenever `ocr_confidence` is unavailable, so every
+    caller that never supplies OCR context sees no behavior change at all.
+    """
+    if match_confidence is None:
+        return None
+    if ocr_confidence is None:
+        return match_confidence
+    ocr_factor = 0.5 + 0.5 * max(0.0, min(1.0, ocr_confidence))
+    return round(match_confidence * ocr_factor, 1)
 
 
 def _strength_agreement_delta(query_strength: StrengthInfo, med: Medicine) -> float:
@@ -162,11 +244,33 @@ def _score_candidate(med: Medicine, base_score: float, query_strength: StrengthI
     return max(0.0, min(100.0, score))
 
 
+# Provenance tag written by scripts/import_legacy_medicines.py for flat-file
+# rows whose brand/generic identity the source data never actually
+# established (see catalog audit section 8) — a name forced into the
+# `generic_name` column purely because the schema has nowhere else to put
+# an unannotated string. `_classify_match_type` checks this so a match
+# against one of these rows is never reported as a confirmed generic
+# identity it doesn't actually have.
+UNCLASSIFIED_NAME_SOURCE_VERSION = "unclassified_name"
+
+
 def _classify_match_type(med: Medicine, stage: str) -> str:
     """UPPER_SNAKE match-type vocabulary for the resolver's richer contract
     (distinct from the lowercase vocabulary medicine_matching.match_token
     uses, kept for backward compatibility on the existing /prescriptions
     endpoint)."""
+    if med.source_version == UNCLASSIFIED_NAME_SOURCE_VERSION:
+        # Brand-vs-generic was never established for this row -- say so,
+        # rather than implying a confirmed generic identity just because
+        # the string happens to live in the generic_name column.
+        if stage in ("exact_brand", "exact_alias", "exact_generic"):
+            return "EXACT_CATALOG_NAME"
+        if stage == "ocr_corrected":
+            return "OCR_NORMALIZED_CATALOG_NAME"
+        if stage == "fuzzy":
+            return "FUZZY_CATALOG_NAME"
+        return "UNKNOWN"
+
     is_rxnorm = med.source == "rxnorm"
     if stage == "exact_brand":
         return "EXACT_BRAND"
@@ -253,6 +357,44 @@ def _disambiguate_by_strength_form(
     return "ambiguous", rows
 
 
+def _has_identity_corroboration(
+    med: Medicine, query_strength: StrengthInfo, query_form: Optional[str]
+) -> bool:
+    """
+    Independent evidence, beyond raw name-string similarity, that this
+    specific candidate is genuinely what the query means — never a check
+    against a specific medicine name (that would be a special case that
+    stops generalizing the moment a new lookalike pair is found); always a
+    property of the evidence itself:
+      - the query separately stated a strength that agrees with this row's
+        own strength, or
+      - the query separately stated a dosage form compatible with this
+        row's own dosage form.
+    Absence of stated strength/form is NOT corroboration either way (it's
+    simply no evidence) — see the module-level SAFETY RULE note for why a
+    fuzzy stage match with neither of these is capped below HIGH_CONFIDENCE.
+    """
+    if query_strength.found and med.strength_value is not None and _strength_matches(med, query_strength):
+        return True
+    if query_form and med.dosage_form and dosage_forms_compatible(query_form, med.dosage_form):
+        return True
+    return False
+
+
+def _exact_after_correction(db: Session, variant: str) -> Optional[Medicine]:
+    """
+    A principled, explainable identity check for one OCR-confusable
+    variant: does it land EXACTLY on a real catalog name/alias? This is
+    categorically stronger evidence than "this fuzzy-scores similarly" —
+    it's the same kind of check stage 1 performs on the raw text, just
+    applied to a single, deliberate character correction instead. Used to
+    gate HIGH_CONFIDENCE for the fuzzy stage without relying on string
+    similarity alone (see module SAFETY RULE).
+    """
+    hit = repo.find_exact(db, variant)
+    return hit.medicine if hit else None
+
+
 def _status_for(confidence: float, margin_ok: bool, is_exact: bool) -> MatchStatus:
     if is_exact:
         return MatchStatus.EXACT
@@ -265,12 +407,21 @@ def _status_for(confidence: float, margin_ok: bool, is_exact: bool) -> MatchStat
     return MatchStatus.NO_MATCH
 
 
-def resolve(db: Session, input_text: str) -> ResolutionResult:
+def resolve(
+    db: Session, input_text: str, ocr_confidence: Optional[float] = None
+) -> ResolutionResult:
     """
     Resolve one piece of OCR text (a token, brand phrase, or short line) to
     a catalog entity. Never raises on bad/empty input or on "no match" — the
     caller always gets a well-formed ResolutionResult with an explicit
     status instead.
+
+    `ocr_confidence` (0.0-1.0, optional): the OCR provider's own certainty
+    about this text span, when the caller has structured OCR data to supply
+    it (see app/services/ocr_geometry.py). Purely informational — exposed
+    via `ResolutionResult.overall_confidence` — and never affects the
+    MatchStatus decision itself, so omitting it (every pre-existing call
+    site does) changes nothing about existing behavior.
     """
     start = time.perf_counter()
     normalized = tn.normalize_text(input_text or "")
@@ -282,6 +433,7 @@ def resolve(db: Session, input_text: str) -> ResolutionResult:
             status=MatchStatus.NO_MATCH,
             parsed_strength=StrengthInfo(),
             parsed_dosage_form=None,
+            ocr_confidence=ocr_confidence,
         )
         result.latency_ms = (time.perf_counter() - start) * 1000
         return result
@@ -291,6 +443,7 @@ def resolve(db: Session, input_text: str) -> ResolutionResult:
     name_portion = strip_form_words(strip_strength_tokens(normalized)) or normalized
 
     result = _resolve_normalized(db, input_text or "", normalized, name_portion, query_strength, query_form)
+    result.ocr_confidence = ocr_confidence
     result.latency_ms = (time.perf_counter() - start) * 1000
 
     logger.info(
@@ -406,7 +559,13 @@ def _resolve_normalized(
         )
 
     # Stages 7+8: controlled fuzzy candidate generation + ranking.
-    all_scored: dict = {}  # medicine.id -> (Medicine, score, match_type)
+    # Each entry: medicine.id -> (Medicine, score, match_type, identity_verified).
+    # `identity_verified` marks a candidate reached via _exact_after_correction
+    # (a literal hit after a principled single-character correction) rather
+    # than raw fuzzy resemblance — see the module SAFETY RULE. It can only be
+    # upgraded (False -> True), never downgraded, if the same medicine is
+    # reached both ways across different variants.
+    all_scored: dict = {}
 
     def consider(term: str, stage: str) -> None:
         candidates = repo.search_candidates(db, term)
@@ -414,24 +573,39 @@ def _resolve_normalized(
             score = _score_candidate(med, base_score, query_strength, query_form)
             prev = all_scored.get(med.id)
             if prev is None or score > prev[1]:
-                all_scored[med.id] = (med, score, _classify_match_type(med, stage))
+                verified = prev[3] if prev else False
+                all_scored[med.id] = (med, score, _classify_match_type(med, stage), verified)
+
+    def consider_verified_exact(variant: str) -> bool:
+        """Returns True if `variant` is a literal catalog hit (and records
+        it), so the caller can skip the weaker fuzzy pass for it entirely."""
+        med = _exact_after_correction(db, variant)
+        if med is None:
+            return False
+        prev = all_scored.get(med.id)
+        if prev is None or not prev[3]:
+            all_scored[med.id] = (med, 100.0, _classify_match_type(med, "ocr_corrected"), True)
+        return True
 
     consider(normalized, "fuzzy")
     if name_portion != normalized:
         consider(name_portion, "fuzzy")
 
-    # Controlled OCR-confusable variants (single substitution at a time) —
-    # medicine-aware, only used here at candidate-generation time, never
-    # applied to canonical storage/normalization.
+    # OCR-confusable variants: check for a literal EXACT hit first (a
+    # principled correction landing on a real identity — strong evidence),
+    # only falling back to fuzzy-scoring the variant like anything else when
+    # it isn't. Never applied to canonical storage/normalization, only here.
     for variant in generate_optical_variants(name_portion)[1:]:
-        consider(variant, "ocr_corrected")
+        if not consider_verified_exact(variant):
+            consider(variant, "ocr_corrected")
     for variant in tn.generate_ocr_variants(name_portion)[1:]:
-        consider(variant, "ocr_corrected")
+        if not consider_verified_exact(variant):
+            consider(variant, "ocr_corrected")
 
-    ranked = sorted(all_scored.values(), key=lambda triple: triple[1], reverse=True)
+    ranked = sorted(all_scored.values(), key=lambda row: row[1], reverse=True)
     candidates = [
         ResolvedCandidate(medicine=med, confidence=round(score, 1), match_type=mtype)
-        for med, score, mtype in ranked[: settings.MEDICINE_CANDIDATE_LIMIT]
+        for med, score, mtype, _verified in ranked[: settings.MEDICINE_CANDIDATE_LIMIT]
     ]
 
     if not candidates:
@@ -444,10 +618,26 @@ def _resolve_normalized(
         )
 
     top = candidates[0]
+    top_medicine, _, _, top_verified = ranked[0]
     margin_ok = len(candidates) == 1 or (top.confidence - candidates[1].confidence) >= settings.MEDICINE_AMBIGUITY_MARGIN
-    status = _status_for(top.confidence, margin_ok, is_exact=False)
+    raw_status = _status_for(top.confidence, margin_ok, is_exact=False)
 
-    if status in (MatchStatus.HIGH_CONFIDENCE, MatchStatus.LOW_CONFIDENCE):
+    # Acceptance gate: a high fuzzy score alone is never sufficient identity
+    # evidence for HIGH_CONFIDENCE (see module SAFETY RULE). Require either a
+    # verified exact-after-correction hit, or independent strength/form
+    # corroboration from the query text. Anything else that scored high
+    # enough to look like HIGH_CONFIDENCE is downgraded to REVIEW_REQUIRED —
+    # never silently accepted, never silently dropped to NO_MATCH either
+    # (there IS a real candidate worth a human look, just not enough to
+    # assert on its own).
+    if raw_status == MatchStatus.HIGH_CONFIDENCE and not (
+        top_verified or _has_identity_corroboration(top_medicine, query_strength, query_form)
+    ):
+        status = MatchStatus.REVIEW_REQUIRED
+    else:
+        status = raw_status
+
+    if status == MatchStatus.HIGH_CONFIDENCE:
         return ResolutionResult(
             input_text=input_text,
             normalized_text=normalized,
@@ -458,9 +648,11 @@ def _resolve_normalized(
             candidates=candidates,
         )
 
-    # REVIEW_REQUIRED (ambiguous) or NO_MATCH (below the low-confidence
-    # floor): never force a pick — surface the candidate set instead so a
-    # human/downstream step can decide, per the safety rule.
+    # LOW_CONFIDENCE, REVIEW_REQUIRED (ambiguous or ungated), or NO_MATCH
+    # (below the low-confidence floor): never force a pick — a wrong medicine
+    # is worse than an unresolved one. `matched` stays None for ALL of these;
+    # candidates are still surfaced for LOW_CONFIDENCE/REVIEW_REQUIRED so a
+    # human/downstream step has something to review, never NO_MATCH.
     return ResolutionResult(
         input_text=input_text,
         normalized_text=normalized,
@@ -468,5 +660,5 @@ def _resolve_normalized(
         parsed_strength=query_strength,
         parsed_dosage_form=query_form,
         matched=None,
-        candidates=candidates if status == MatchStatus.REVIEW_REQUIRED else [],
+        candidates=candidates if status in (MatchStatus.REVIEW_REQUIRED, MatchStatus.LOW_CONFIDENCE) else [],
     )

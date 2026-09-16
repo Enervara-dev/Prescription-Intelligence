@@ -1,0 +1,20 @@
+{
+  "notes": "Synthetic stand-in for a handwritten entry: low per-word OCR confidence (simulating uncertain character recognition) but a string that still normalizes/OCR-corrects to a real catalog identity. Verifies OCR confidence survives into overall_confidence (dampening it) even when the name itself resolves cleanly -- NOT a measurement of Google Vision's real handwriting recognition accuracy, which this repository has never tested against a real handwritten image.",
+  "words": [
+    {"text": "D0LO", "confidence": 0.42, "x": 10, "y": 100, "width": 45, "height": 24},
+    {"text": "650", "confidence": 0.55, "x": 65, "y": 103, "width": 35, "height": 24},
+    {"text": "1-0-1", "confidence": 0.50, "x": 150, "y": 101, "width": 50, "height": 24}
+  ],
+  "catalog": [
+    {
+      "external_id": "legacy:dolo-650", "brand_name": "Dolo 650", "generic_name": "Paracetamol",
+      "aliases": ["dolo", "dolo650", "dolo 650", "dolo-650"],
+      "strength": "650mg", "strength_value": 650, "strength_unit": "mg",
+      "dosage_form": "tablet", "source": "legacy_manual"
+    }
+  ],
+  "expected_medicines": [
+    {"name": "Dolo 650", "strength": "650mg", "dosage": "N/A", "frequency": "1-0-1 (M-A-N)", "duration": null}
+  ],
+  "expect_overall_confidence_below_match_confidence": true
+}

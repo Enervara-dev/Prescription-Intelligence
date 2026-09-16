@@ -115,10 +115,15 @@ async def process_prescription(
         # 1. OCR + Auto-Orientation + Categorisation
         ocr_result = extract_text_from_images(pil_images)
 
-        # 2. Parse medicines from medicine text, fallback to full text if needed
-        medicines = parse_medicines(ocr_result["medicine_text"], db)
+        # 2. Parse medicines from medicine text, fallback to full text if
+        # needed. `medicine_ocr_lines` (when present) carries per-word
+        # geometry/confidence through to the resolver -- see
+        # app/services/extraction/__init__.py and ocr_geometry.py.
+        medicines = parse_medicines(
+            ocr_result["medicine_text"], db, ocr_lines=ocr_result.get("medicine_ocr_lines")
+        )
         if not medicines and ocr_result["full_text"]:
-            medicines = parse_medicines(ocr_result["full_text"], db)
+            medicines = parse_medicines(ocr_result["full_text"], db, ocr_lines=ocr_result.get("all_ocr_lines"))
 
         final_patient_info = _clean_patient_info(ocr_result, medicines)
 
@@ -192,9 +197,11 @@ async def extract_prescription(
     try:
         ocr_result = extract_text_from_images(pil_images)
 
-        medicines = parse_medicines(ocr_result["medicine_text"], db)
+        medicines = parse_medicines(
+            ocr_result["medicine_text"], db, ocr_lines=ocr_result.get("medicine_ocr_lines")
+        )
         if not medicines and ocr_result["full_text"]:
-            medicines = parse_medicines(ocr_result["full_text"], db)
+            medicines = parse_medicines(ocr_result["full_text"], db, ocr_lines=ocr_result.get("all_ocr_lines"))
 
         patient_info = _clean_patient_info(ocr_result, medicines)
         extraction = build_extraction(patient_info, medicines)

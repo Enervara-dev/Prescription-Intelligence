@@ -52,6 +52,19 @@ def run() -> int:
                 "brand_name": None,
                 "aliases": [],
                 "source": "legacy_manual",
+                # This flat file never distinguishes brand from generic
+                # identity -- many of these names are actually brands
+                # (Dolo, Crocin, Omez, ...) forced into generic_name purely
+                # because the source data gives no other signal. Tagging
+                # this explicitly (rather than asserting a generic identity
+                # we don't actually know) lets the resolver report an
+                # honest "unclassified catalog name" match type instead of
+                # a confirmed-but-fabricated EXACT_GENERIC -- see
+                # medicine_resolver.UNCLASSIFIED_NAME_SOURCE_VERSION. Rows
+                # also curated in app/data/indian_brands.py (matched by
+                # slug) get overwritten with a real brand/generic split by
+                # scripts/seed_indian_brands.py and lose this tag.
+                "source_version": "unclassified_name",
             }
             for name in names
         ]

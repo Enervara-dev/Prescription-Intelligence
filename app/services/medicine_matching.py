@@ -40,11 +40,25 @@ class MedicineMatch:
 
 
 def generate_optical_variants(token: str) -> list[str]:
-    """Same optical-confusable variant generation the old in-memory matcher used."""
+    """
+    One variant per individual OCCURRENCE of each optical-confusable pair,
+    correcting only that one occurrence — not a single all-occurrences-at-
+    once replacement. A token with two unrelated confusable characters
+    should not be forced to correct both simultaneously just to be
+    considered; doing so can turn an unrelated word into a different
+    unrelated word rather than the one correction that was actually needed.
+    For the common case of a single occurrence, this produces the exact
+    same variant as the previous all-at-once replacement.
+    """
     variants = [token]
     for old, new in _OPTICAL_REPLACEMENTS:
-        if old in token:
-            variants.append(token.replace(old, new))
+        start = 0
+        while True:
+            idx = token.find(old, start)
+            if idx == -1:
+                break
+            variants.append(token[:idx] + new + token[idx + len(old) :])
+            start = idx + 1
     return variants
 
 

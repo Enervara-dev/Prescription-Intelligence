@@ -3,15 +3,23 @@ ocr_service.py
 --------------
 Google Cloud Vision-based text extraction.
 Categorises raw extracted words into patient_info vs medicine text sections.
-Preserves line-level structure for accurate medicine parsing.
+Preserves line-level structure AND per-word geometry/confidence for accurate
+medicine parsing -- see app/services/ocr_geometry.py for the resolution-
+adaptive line-reconstruction algorithm. Plain-text fields (`patient_info`,
+`medicine_text`, `full_text`) are still produced for backward compatibility
+with every existing caller/test; `medicine_lines`/`patient_lines` additionally
+expose the structured `OCRLine` objects (words, bounding box, confidence)
+for callers that can use them (see app/services/extraction/__init__.py).
 """
 
 import io
 import os
 import re
-from typing import List, Dict, Any, Tuple
+from typing import Any, Tuple
 from PIL import Image
 from dotenv import load_dotenv
+
+from app.services.ocr_geometry import OCRLine, OCRWord, group_words_into_lines
 
 # Load environment variables from the project root .env
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '..', '..', '.env'))
@@ -35,89 +43,97 @@ def _get_api_key() -> str:
         )
     return key
 
-def _extract_page_details(image: Image.Image) -> list[dict]:
-    """Single-pass OCR on one page using Google Cloud Vision API. Returns list of {word, confidence, y, x} dicts."""
+def _extract_page_words(image: Image.Image) -> list[OCRWord]:
+    """
+    Single-pass OCR on one page using Google Cloud Vision API. Returns the
+    full per-word bounding box (not just its top-left corner) and its own
+    confidence -- both required for resolution-adaptive line reconstruction
+    (app/services/ocr_geometry.py) and for carrying OCR certainty downstream
+    instead of discarding it at ingestion, which the previous implementation
+    did (confidence was captured here and then never read again).
+    """
     if vision is None:
         raise ImportError("google-cloud-vision is not installed. Run: pip install google-cloud-vision")
-    
+
     # Initialize the client using the API key from .env
     client = vision.ImageAnnotatorClient(
         client_options={"api_key": _get_api_key()}  # type: ignore
     )
-    
+
     # Convert PIL Image to bytes
     img_byte_arr = io.BytesIO()
     image.save(img_byte_arr, format='PNG')
     content = img_byte_arr.getvalue()
-    
+
     vision_image = vision.Image(content=content)
-    
+
     # Restrict OCR to English only to prevent Cyrillic/non-English hallucinations on messy handwriting
     image_context = vision.ImageContext(language_hints=['en'])
-    
+
     # Use document_text_detection for dense text / handwriting
     response = client.document_text_detection(
-        image=vision_image, 
+        image=vision_image,
         image_context=image_context
     )
-    
+
     if response.error.message:
         raise Exception(
             f"{response.error.message}\nFor more info on error messages, check: "
             "https://cloud.google.com/apis/design/errors"
         )
 
-    details = []
-    
+    words: list[OCRWord] = []
+
     for page in response.full_text_annotation.pages:
         for block in page.blocks:
             for paragraph in block.paragraphs:
                 for word in paragraph.words:
                     word_text = ''.join([symbol.text for symbol in word.symbols])
-                    
+
                     if not word_text:
                         continue
-                        
+
                     # Noise filter: skip single-character tokens (except medical markers like T, C)
                     if len(word_text) <= 1 and word_text.upper() not in ('T', 'C'):
                         continue
                     # Skip pure punctuation
                     if re.match(r'^[^\w\s]+$', word_text):
                         continue
-                        
-                    # Get bounding box vertices
-                    # A word's bounding box has 4 vertices. Let's find top-left to get x, y
+
+                    # Full bounding box, not just the top-left corner -- width
+                    # and height are what makes line grouping resolution-
+                    # adaptive (see ocr_geometry.group_words_into_lines).
                     vertices = word.bounding_box.vertices
-                    x_left = min(v.x for v in vertices) if vertices else 0
-                    y_top = min(v.y for v in vertices) if vertices else 0
-                    
+                    xs = [v.x for v in vertices] or [0]
+                    ys = [v.y for v in vertices] or [0]
+                    x_left, y_top = min(xs), min(ys)
+                    width = max(xs) - x_left
+                    height = max(ys) - y_top
+
                     confidence = word.confidence
-                    
+
                     if confidence < CONFIDENCE_THRESHOLD:
                         continue
 
-                    details.append({
-                        "word": word_text,
-                        "confidence": round(float(confidence), 4),
-                        "y": y_top,
-                        "x": x_left,
-                    })
+                    words.append(OCRWord(
+                        text=word_text,
+                        confidence=round(float(confidence), 4),
+                        x=x_left,
+                        y=y_top,
+                        width=width,
+                        height=height,
+                    ))
 
-    # Sort reading order: top-to-bottom, left-to-right
-    def reading_order(item):
-        return (item["y"] // 20, item["x"])
-
-    details.sort(key=reading_order)
-    return details
+    return words
 
 
-def _auto_orient_page(image: Image.Image) -> Tuple[Image.Image, list[dict]]:
+def _auto_orient_page(image: Image.Image) -> Tuple[Image.Image, list[OCRWord]]:
     """
-    Extract page details. Google Cloud Vision automatically handles orientation,
+    Extract page words. Google Cloud Vision automatically handles orientation,
     so we just pass the original image.
     """
-    page_details = _extract_page_details(image)
-    return image, page_details
+    page_words = _extract_page_words(image)
+    return image, page_words
 
 
 # ---------------------------------------------------------------------------
@@ -140,47 +156,23 @@ def _is_ad(text: str) -> bool:
     return any(frag in low for frag in _AD_FRAGMENTS)
 
 
-def _details_to_lines(details: list[dict], line_y_threshold: int = 18) -> list[str]:
-    """Group token dicts into line strings based on spatial y-coordinates."""
-    if not details:
-        return []
-    sorted_items = sorted(details, key=lambda d: (d.get("y", 0), d.get("x", 0)))
-    lines = []
-    curr_line = []
-    curr_y = None
-
-    for d in sorted_items:
-        y = d.get("y", 0)
-        if curr_y is None or abs(y - curr_y) <= line_y_threshold:
-            curr_line.append(d["word"])
-            if curr_y is None:
-                curr_y = y
-        else:
-            if curr_line:
-                lines.append(" ".join(curr_line))
-            curr_line = [d["word"]]
-            curr_y = y
-
-    if curr_line:
-        lines.append(" ".join(curr_line))
-
-    return lines
-
-
-def _categorize(details: list[dict]) -> tuple[str, str]:
+def _categorize(lines: list[OCRLine]) -> tuple[list[OCRLine], list[OCRLine]]:
     """
-    Categorise lines into patient_info and medicine_text.
+    Categorise reconstructed lines into patient_info and medicine sections.
+    Operates on structured OCRLine objects (not flattened strings) so the
+    caller can still reach each line's words/bounding-box/confidence after
+    categorisation -- only the classification decision itself uses the
+    line's plain text.
     """
-    lines = _details_to_lines(details)
-    patient_lines = []
-    medicine_lines = []
+    patient_lines: list[OCRLine] = []
+    medicine_lines: list[OCRLine] = []
     in_medicine_section = False
 
     for line in lines:
-        if _is_ad(line):
+        if _is_ad(line.text):
             continue
 
-        low = line.lower()
+        low = line.text.lower()
 
         # Triggers for medicine section
         if (any(k in low for k in [" rx", "rx ", "r/", "treatment", "medicine", "medication", "adv:", "advise", "adv"])
@@ -196,7 +188,7 @@ def _categorize(details: list[dict]) -> tuple[str, str]:
     if not medicine_lines:
         medicine_lines = lines
 
-    return "\n".join(patient_lines), "\n".join(medicine_lines)
+    return patient_lines, medicine_lines
 
 
 # ---------------------------------------------------------------------------
@@ -205,24 +197,34 @@ def _categorize(details: list[dict]) -> tuple[str, str]:
 
 def extract_text_from_images(images: list[Image.Image]) -> dict[str, Any]:
     """
-    Run OCR on one or more images.
-    Returns categorised text and oriented image references.
+    Run OCR on one or more images. Returns categorised text (backward-
+    compatible plain-text fields, unchanged shape for every existing
+    caller/test) AND the structured OCRLine objects behind them
+    (`medicine_ocr_lines` / `patient_ocr_lines`) for callers that can use
+    per-word geometry and confidence -- see
+    app/services/extraction/__init__.py, which uses these when present and
+    falls back to the plain-text fields otherwise.
     """
-    all_details = []
+    all_words: list[OCRWord] = []
     oriented_images = []
 
     for img in images:
-        best_img, page_details = _auto_orient_page(img)
+        best_img, page_words = _auto_orient_page(img)
         oriented_images.append(best_img)
-        all_details.extend(page_details)
+        all_words.extend(page_words)
 
-    patient_text, medicine_text = _categorize(all_details)
-    all_lines = _details_to_lines(all_details)
+    all_lines = group_words_into_lines(all_words)
+    patient_lines, medicine_lines = _categorize(all_lines)
 
     return {
-        "patient_info": patient_text,
-        "medicine_text": medicine_text,
-        "full_text": "\n".join(all_lines),
-        "word_count": len(all_details),
+        "patient_info": "\n".join(l.text for l in patient_lines),
+        "medicine_text": "\n".join(l.text for l in medicine_lines),
+        "full_text": "\n".join(l.text for l in all_lines),
+        "word_count": len(all_words),
         "oriented_images": oriented_images,
+        # Structured, geometry/confidence-preserving representation of the
+        # same lines above -- additive; nothing existing reads these keys.
+        "medicine_ocr_lines": medicine_lines,
+        "patient_ocr_lines": patient_lines,
+        "all_ocr_lines": all_lines,
     }

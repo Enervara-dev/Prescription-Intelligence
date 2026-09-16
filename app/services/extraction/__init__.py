@@ -1,42 +1,69 @@
 """
 extraction/__init__.py
 -----------------------
-Medicine parsing: turns raw OCR text into structured medicine entries.
+Medicine parsing: turns raw OCR text (or, when available, structured
+OCRLine objects — see app/services/ocr_geometry.py) into structured
+medicine entries.
 
-Field extraction (dosage/frequency/duration) is pure regex over the OCR line
-and unrelated to the catalog. Name resolution (which medicine a token refers
-to) is delegated to `app.services.medicine_resolver.resolve()` — the Indian
-medicine normalization pipeline (text normalization -> strength/dosage-form
-extraction -> exact/fuzzy matching hierarchy -> confidence policy). Only
-EXACT and HIGH_CONFIDENCE results are accepted here; REVIEW_REQUIRED,
-LOW_CONFIDENCE, and NO_MATCH are all treated the same way this pipeline
-always has -- silently skipped, never forced into the result. This is the
-same safety behaviour `medicine_matching.match_token()` had before it, just
-backed by the richer resolver.
+Name resolution (which medicine a token/phrase refers to) is delegated to
+`app.services.medicine_resolver.resolve()` — the Indian medicine
+normalization pipeline. Only EXACT and HIGH_CONFIDENCE results are ever
+accepted here; REVIEW_REQUIRED, LOW_CONFIDENCE, and NO_MATCH are all
+silently skipped — never forced into the result.
 
-`medicine_matching.match_token()` itself is unchanged and left in place
-(still covered by its own tests) even though this module no longer calls
-it — `GET /api/v1/medicines/search` uses `medicine_matching.search_many()`
-instead, which was already independent of `match_token()`.
+Candidate generation is CATALOG-AWARE and SPAN-BASED rather than a fixed
+minimum-length pre-filter: a token is only skipped up front when its SHAPE
+makes it obviously non-medicine (a bare number, a frequency/duration
+pattern, a dosage-form word alone, a known stopword) — never because it is
+merely short. A short real brand name (e.g. "Pan" in "Pan 40") must still
+reach the resolver when combined with an adjacent token — a fixed length
+floor applied before combination was a confirmed bug (see the OCR/matching
+forensic audit, section 3).
+
+The scanner also does not stop at the first confident match on a line: it
+advances a cursor token-by-token, so a line/row that legitimately contains
+more than one medicine (or that OCR reconstruction happened to merge two
+rows into one) can still yield more than one result, each with its own
+dosage/frequency/duration extracted only from the text BETWEEN it and the
+next medicine on the line (never the whole line, which would risk
+cross-assigning one medicine's instructions to another — see audit
+section 13).
 """
 
 import logging
 import re
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Sequence
 
 from sqlalchemy.orm import Session
 
-from app.services.medicine_resolver import MatchStatus
+from app.services.dosage_form import normalize_dosage_form
+from app.services.medicine_resolver import MatchStatus, fuse_confidence
 from app.services.medicine_resolver import resolve as resolve_medicine
+from app.services.ocr_geometry import OCRLine
 
 logger = logging.getLogger(__name__)
 
 # Statuses accepted as a confident match for the prescription pipeline.
 # Everything else (REVIEW_REQUIRED, LOW_CONFIDENCE, NO_MATCH) maps to the
-# pipeline's existing "unmatched" behaviour: the line/token is simply
-# omitted from the result, exactly as before.
+# pipeline's existing "unmatched" behaviour: the span is simply omitted from
+# the result, exactly as before.
 _CONFIDENT_STATUSES = frozenset({MatchStatus.EXACT, MatchStatus.HIGH_CONFIDENCE})
+
+# Longest medicine-name span (in tokens) the scanner will try at any one
+# starting position: covers "medicine + strength" ("Dolo 650"), "medicine +
+# form" or brand names with an internal space, and the rare three-token
+# case ("Vitamin B 12", combination names). Kept deliberately small — this
+# is a candidate-generation bound, not a claim about real name lengths; the
+# resolver's own catalog lookup is what actually decides a match, not this
+# number.
+_MAX_SPAN_TOKENS = 3
+
+# How many consecutive medicine-less lines after a matched medicine are
+# still eligible to supply its dosage/frequency/duration (e.g. printed on
+# their own row/line beneath the name). Bounded so association can't drift
+# arbitrarily far from the medicine it's meant to describe.
+_MAX_INSTRUCTION_LOOKAHEAD_LINES = 2
 
 # ---------------------------------------------------------------------------
 # Frequency mapping
@@ -45,7 +72,9 @@ _CONFIDENT_STATUSES = frozenset({MatchStatus.EXACT, MatchStatus.HIGH_CONFIDENCE}
 FREQ_MAP = {
     "OD":   "Once Daily",
     "BD":   "Twice Daily",
+    "BID":  "Twice Daily",
     "TDS":  "Thrice Daily",
+    "TID":  "Thrice Daily",
     "QID":  "Four Times Daily",
     "HS":   "At Bedtime",
     "SOS":  "When Required",
@@ -59,7 +88,9 @@ FREQ_MAP = {
 }
 
 # ---------------------------------------------------------------------------
-# Common non-medicine words to ignore (English stopwords + Prescription boilerplate)
+# Common non-medicine words to ignore (English stopwords + Prescription
+# boilerplate). Shape-based noise filtering, never a length rule — see
+# module docstring and audit section 3/4.
 # ---------------------------------------------------------------------------
 
 SKIP_WORDS = {
@@ -85,8 +116,24 @@ SKIP_WORDS = {
     "advised", "meditation", "exercises", "fruits", "vegetables", "fibre",
     "heaviness", "bloating", "nausea", "vomiting", "vomitings", "stools", "loss", "fever",
     "cough", "review", "candida", "effects", "mucas", "mucus", "srivathsa", "rivathsa",
-    "kims", "medical",
+    "kims", "medical", "as", "directed", "instructed", "advised",
 }
+
+_FREQ_KEYWORDS = set(FREQ_MAP.keys())
+_DURATION_RE = re.compile(r"\b\d+\s?(day|days|week|weeks|month|months)\b", re.IGNORECASE)
+_FREQ_FRACTIONAL_TRIAD_RE = re.compile(r"\b(\d/\d|\d)\s*-\s*(\d/\d|\d)\s*-\s*(\d/\d|\d)\b")
+_FREQ_TRIAD_RE = re.compile(r"\b(\d|\-)\s*[-/]\s*(\d|\-)\s*[-/]\s*(\d|\-)\b")
+_FREQ_OPTICAL_TRIAD_RE = re.compile(r"\b([01tli])\s*[-/]\s*([01tlio])\s*[-/]\s*([01tlio])\b", re.IGNORECASE)
+_PURE_NUMBER_RE = re.compile(r"^\d+(\.\d+)?$")
+# Genuine administration-dose phrasing — how MUCH to take per dose, distinct
+# from strength (how much is IN one unit) and frequency (how often). Only
+# fires on real amount+unit phrasing; never inferred otherwise (audit
+# section 10).
+_DOSAGE_RE = re.compile(
+    r"\b(\d+/\d+|\d+(?:\.\d+)?|half|one|two|three)\s*-?\s*"
+    r"(tablets?|tabs?|capsules?|caps?|drops?|puffs?|spoons?|tsp|teaspoons?)\b",
+    re.IGNORECASE,
+)
 
 
 def _clean_word(word: str) -> str:
@@ -99,22 +146,31 @@ def _clean_token_letters(token: str) -> str:
     return re.sub(r'[^a-zA-Z]', '', token).lower()
 
 
-def _clean_token_alnum(token: str) -> str:
-    return re.sub(r'[^a-zA-Z0-9]', '', token).lower()
-
-
-def _is_skip_token(token: str) -> bool:
-    """Cheap pre-filter so we don't hit the DB for obvious boilerplate words."""
-    words = token.split()
-    if any(_clean_token_letters(w) in SKIP_WORDS for w in words):
+def _is_noise_token(raw_word: str) -> bool:
+    """
+    SHAPE-based pre-filter, never a length rule: a token is skipped up front
+    only when it obviously cannot be (the start of) a medicine name — a
+    stopword, a bare number, a frequency/duration pattern, or a dosage-form
+    word alone. A short but real brand name (e.g. "Pan") is NOT filtered
+    here; it reaches the span scanner like anything else and is only ever
+    accepted if the catalog actually resolves it (see module docstring).
+    """
+    w = _clean_word(raw_word)
+    if not w:
         return True
-    # Length is measured on the alnum-cleaned token, NOT letters-only: an
-    # OCR-corrupted brand like "D0LO" is 4 real characters but only 3
-    # letters once the garbled digit is stripped for a letters-only count --
-    # that used to make this filter reject it before it ever reached the
-    # matcher (real bug, found via a full OCR-pipeline integration test:
-    # "D0LO 650" resolved to nothing at all, not even the wrong thing).
-    if len(_clean_token_alnum(token)) < 4:
+    if _clean_token_letters(w) in SKIP_WORDS:
+        return True
+    if _PURE_NUMBER_RE.match(w):
+        return True
+    if w.upper() in _FREQ_KEYWORDS:
+        return True
+    if _FREQ_TRIAD_RE.fullmatch(w) or _FREQ_FRACTIONAL_TRIAD_RE.fullmatch(w):
+        return True
+    if _DURATION_RE.fullmatch(w):
+        return True
+    if normalize_dosage_form(w) is not None:
+        # A bare dosage-form word/abbreviation ("Tab", "Cap", "Syrup", ...)
+        # is never itself a medicine name.
         return True
     return False
 
@@ -123,58 +179,88 @@ def _is_skip_token(token: str) -> bool:
 # Field extractors (pure regex, unrelated to the medicine catalog)
 # ---------------------------------------------------------------------------
 
-def _extract_dosage(line: str, med_name: str) -> str:
-    match = re.search(r'(\d{1,4}(?:\.\d+)?)\s?(mg|ml|mcg|iu|gm?)\b', line, re.IGNORECASE)
+def _extract_strength_text(text: str) -> str:
+    """
+    Detects a strength-SHAPED token in free text (e.g. "500mg") — how much
+    is in one unit of the medicine. Distinct from `_extract_dosage` (how
+    much to take per administration) — conflating the two was a confirmed
+    bug (audit section 10): the field previously named "dosage" actually
+    re-detected strength. Kept as its own function because
+    enervara_extraction_adapter.py still needs a text-derived strength
+    fallback for catalog rows with no structured strength_value.
+    """
+    match = re.search(r'(\d{1,4}(?:\.\d+)?)\s?(mg|ml|mcg|iu|gm?)\b', text, re.IGNORECASE)
     if match:
         return match.group(0).strip()
-    match_bracket_num = re.search(r'[\(\[]\s*(\d{1,4})\s*(?:mg|ml)?[\)\]]', line, re.IGNORECASE)
+    match_bracket_num = re.search(r'[\(\[]\s*(\d{1,4})\s*(?:mg|ml)?[\)\]]', text, re.IGNORECASE)
     if match_bracket_num:
         return f"{match_bracket_num.group(1)}mg"
-    match_ratio = re.search(r'\(?\s*\d+(?:\.\d+)?\s*/\s*\d+(?:\.\d+)?\s*\)?', line)
+    match_ratio = re.search(r'\(?\s*\d+(?:\.\d+)?\s*/\s*\d+(?:\.\d+)?\s*\)?', text)
     if match_ratio:
         return match_ratio.group(0).strip()
-    match_form = re.search(r'\b(CD3|D3|Plus|NXT|SR|XL|Forte)\b', line, re.IGNORECASE)
+    match_form = re.search(r'\b(CD3|D3|Plus|NXT|SR|XL|Forte)\b', text, re.IGNORECASE)
     if match_form:
         return match_form.group(0).strip()
     return "N/A"
 
 
-def _extract_duration(line: str, med_name: str) -> str:
-    match = re.search(r'(\d+)\s?(day|days|week|weeks|month|months)\b', line, re.IGNORECASE)
-    if match:
-        return match.group(0).strip()
-    match_circle = re.search(r'[\(\[]\s*(\d{1,3})\s*[\)\]]', line)
-    if match_circle:
-        val = int(match_circle.group(1))
-        if val in (1, 3, 5, 7, 10, 14, 15, 21, 30, 60, 90):
-            return f"{val} days"
-    return "N/A"
+def _extract_dosage(text: str) -> str:
+    """
+    Genuine administration dosage — how much to take per dose (e.g. "1
+    tablet", "2 drops"). Only extracted when the text actually contains
+    amount+unit phrasing; never inferred from a bare number or from
+    strength (audit section 10). Real prescriptions very often never state
+    this explicitly (the frequency triad implies "one dose" by convention)
+    — returning "N/A" in that case is the honest answer, not a gap to guess
+    around.
+    """
+    match = _DOSAGE_RE.search(text)
+    return match.group(0).strip() if match else "N/A"
 
 
-def _extract_frequency(line: str, med_name: str) -> str:
-    upper = line.upper()
+def _extract_duration(text: str) -> str:
+    """
+    Only extracts duration when the text contains an explicit unit (day(s)/
+    week(s)/month(s)). A bare bracketed number like "(5)" is NOT treated as
+    "5 days" — that was a confirmed hallucination (audit section 12): there
+    is no unit anywhere in the source text to justify it.
+    """
+    match = _DURATION_RE.search(text)
+    return match.group(0).strip() if match else "N/A"
+
+
+def _extract_frequency(text: str) -> str:
+    upper = text.upper()
     for key, value in FREQ_MAP.items():
-        if re.search(r'\b' + key + r'\b', upper):
+        if re.search(r'\b' + re.escape(key) + r'\b', upper):
             return value
-    m3 = re.search(r'\b(\d|\-)\s*[-/]\s*(\d|\-)\s*[-/]\s*(\d|\-)\b', line)
+
+    # Fractional triad first ("1/2-0-1") -- a segment may itself be a
+    # fraction; the separator between segments is always '-' here (never
+    # '/', which would be ambiguous with a fraction inside a segment).
+    mf = _FREQ_FRACTIONAL_TRIAD_RE.search(text)
+    if mf:
+        return f"{mf.group(1)}-{mf.group(2)}-{mf.group(3)} (M-A-N)"
+
+    m3 = _FREQ_TRIAD_RE.search(text)
     if m3:
         return f"{m3.group(0)} (M-A-N)"
 
     # Cursive optical misreadings of 1-0-1 or 1-0-0 (e.g. t-0-0, 1-o-1, l-0-l)
-    m_opt = re.search(r'\b([01tli])\s*[-/]\s*([01tlio])\s*[-/]\s*([01tlio])\b', line, re.IGNORECASE)
+    m_opt = _FREQ_OPTICAL_TRIAD_RE.search(text)
     if m_opt:
         def norm_d(c):
             return '1' if c.lower() in ('1', 't', 'l', 'i') else '0'
         return f"{norm_d(m_opt.group(1))}-{norm_d(m_opt.group(2))}-{norm_d(m_opt.group(3))} (M-A-N)"
 
-    m_time = re.search(r'\b(\d{1,2}\s*(?:AM|PM)|bedtime|morning|night|ep|evening)\b', line, re.IGNORECASE)
+    m_time = re.search(r'\b(\d{1,2}\s*(?:AM|PM)|bedtime|morning|night|ep|evening)\b', text, re.IGNORECASE)
     if m_time:
         t = m_time.group(0).strip()
         if t.lower() == 'ep':
             return "Evening"
         return t.capitalize()
 
-    m_dashes = re.search(r'\b\d\s*-\s*\d\b', line)
+    m_dashes = re.search(r'\b\d\s*-\s*\d\b', text)
     if m_dashes:
         return m_dashes.group(0).replace(" ", "")
 
@@ -182,100 +268,210 @@ def _extract_frequency(line: str, med_name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Span-based candidate scanning
+# ---------------------------------------------------------------------------
+
+def _tokenize(line: str) -> List[str]:
+    line_clean = re.sub(r'[^A-Za-z0-9\s/\-\(\)\.]', ' ', line)
+    line_clean = re.sub(r'\s+', ' ', line_clean).strip()
+    return line_clean.split() if line_clean else []
+
+
+def _scan_line_for_medicines(
+    db: Session, words: List[str], ocr_confidence: Optional[float], stats: Dict[str, int]
+) -> List[tuple]:
+    """
+    Forward-scanning span search: tries spans of decreasing length (3, 2, 1
+    tokens) at each cursor position, accepting the LONGEST confident match
+    found (more specific beats less specific — "Dolo 650" over bare "Dolo").
+    Does not stop after the first match: the cursor advances past whatever
+    was consumed (a matched span, a genuinely conflicting span, or one
+    token) and scanning continues, so a line with more than one medicine is
+    not structurally limited to reporting only the first.
+
+    A REVIEW_REQUIRED result at a given span is only allowed to block
+    retrying a SHORTER span at the same position when the query itself
+    stated a strength (`result.parsed_strength.found`) — that is exactly
+    the "Dolo 680mg must never silently become Dolo 650" case: falling back
+    to the bare name would discard the stated, conflicting strength. A
+    REVIEW_REQUIRED for any other reason (generic ambiguity, an
+    uncorroborated fuzzy score) does NOT block shorter spans — there is no
+    conflicting evidence to protect, just insufficient evidence at the
+    longer span, and a shorter span may still resolve cleanly (e.g. combined
+    "amoxicillin as" being too weak a fuzzy match must not prevent bare
+    "amoxicillin" from resolving on its own).
+
+    Returns a list of (start, end_exclusive, ResolvedCandidate) tuples, in
+    line order, never overlapping.
+    """
+    matches: List[tuple] = []
+    i = 0
+    n = len(words)
+    while i < n:
+        if _is_noise_token(words[i]):
+            i += 1
+            continue
+
+        max_len = min(_MAX_SPAN_TOKENS, n - i)
+        accepted = None
+        strength_conflict_len = None
+
+        for span_len in range(max_len, 0, -1):
+            phrase = " ".join(_clean_word(w) for w in words[i : i + span_len]).strip()
+            if not phrase:
+                continue
+            result = resolve_medicine(db, phrase, ocr_confidence=ocr_confidence)
+            stats[result.status.value] = stats.get(result.status.value, 0) + 1
+            if result.status in _CONFIDENT_STATUSES and result.matched is not None:
+                accepted = (span_len, result.matched)
+                break
+            if (
+                result.status == MatchStatus.REVIEW_REQUIRED
+                and result.parsed_strength.found
+                and result.candidates
+                and result.candidates[0].match_type
+                in ("EXACT_ALIAS", "EXACT_BRAND", "EXACT_CATALOG_NAME")
+            ):
+                # Genuine strength conflict on an otherwise-exact NAME match
+                # (e.g. "Dolo 680mg" hitting the 650mg product's alias
+                # exactly, but with a conflicting stated strength) -- stop
+                # here. Trying a SHORTER span next (bare "Dolo") would
+                # silently discard the very strength that caused the
+                # conflict and resolve to the wrong product with full
+                # confidence ("Dolo 680 must never become Dolo 650").
+                #
+                # Deliberately narrower than "any REVIEW_REQUIRED that
+                # mentions a strength": a FUZZY-stage candidate downgraded by
+                # the identity-corroboration gate (see medicine_resolver.py)
+                # also reports parsed_strength.found=True whenever the query
+                # text happens to contain a strength number, even with no
+                # real conflict — that is "not sure this is the right
+                # medicine at all", not "conflicting strength on a confirmed
+                # identity", and must NOT block a shorter span from cleanly
+                # resolving (e.g. a misspelled "Amoxycillin 500mg BD" must
+                # still let bare "Amoxycillin" reach and OCR-correct to the
+                # real "Amoxicillin").
+                strength_conflict_len = span_len
+                break
+
+        if accepted is not None:
+            span_len, matched = accepted
+            matches.append((i, i + span_len, matched))
+            i += span_len
+        elif strength_conflict_len is not None:
+            # Genuine strength conflict: skip past the whole conflicting
+            # span without asserting anything, and without retrying a
+            # shorter span here that would discard the stated strength.
+            i += strength_conflict_len
+        else:
+            i += 1
+
+    return matches
+
+
+# ---------------------------------------------------------------------------
 # Main parsing function
 # ---------------------------------------------------------------------------
 
-def _confident_resolve(db: Session, term: str, stats: Dict[str, int]):
+def _line_texts_and_confidence(
+    text: str, ocr_lines: Optional[Sequence[OCRLine]]
+) -> List[tuple]:
     """
-    Resolve one candidate term via the medicine_resolver pipeline, accepting
-    only EXACT/HIGH_CONFIDENCE. Returns the matched candidate (same shape the
-    old `MedicineMatch` had: `.medicine` / `.confidence` / `.match_type`) or
-    None. `stats` is mutated in place purely for the one summary log line
-    `parse_medicines` emits per call — never logs per-token, to avoid
-    flooding logs (a single line can attempt a dozen+ word/bigram lookups).
+    Returns [(line_text, ocr_confidence_or_None), ...]. Prefers structured
+    OCRLine data (real per-line OCR confidence) when the caller has it;
+    falls back to splitting the plain-text `text` (ocr_confidence=None for
+    every line) otherwise — the path every existing caller/test without
+    OCR geometry context takes, unchanged from previous behaviour.
     """
-    result = resolve_medicine(db, term)
-    stats[result.status.value] = stats.get(result.status.value, 0) + 1
-    if result.status in _CONFIDENT_STATUSES and result.matched is not None:
-        return result.matched
-    return None
+    if ocr_lines:
+        return [(line.text, line.confidence) for line in ocr_lines]
+    if not text or not text.strip():
+        return []
+    # `text.split("\n")` on a string with no newline at all naturally
+    # returns a single-element list -- exactly right, since a real OCR
+    # result with only one detected row/line produces exactly this
+    # (ocr_service.py joins lines with "\n", so a 1-line result has none).
+    # Treating it as one line, rather than re-chunking it by word count via
+    # _split_into_lines, is what lets the span scanner see the whole line at
+    # once — needed for multi-medicine detection and correct instruction
+    # windowing, both of which an arbitrary mid-line cut would break.
+    return [(line, None) for line in text.split("\n")]
 
 
-def parse_medicines(text: str, db: Session) -> List[Dict[str, Any]]:
+def _merge_instruction_only_line(pending: Dict[str, Any], line_text: str) -> bool:
     """
-    Parse raw OCR text into a structured list of medicines, matching names
-    against the Postgres-backed catalog via the Indian medicine
-    normalization pipeline (see `app.services.medicine_resolver.resolve`).
+    Fills in whichever of dosage/frequency/duration `pending` is still
+    missing, from a line that itself contained no resolvable medicine —
+    the common "medicine name on one line, dosage/frequency/duration on the
+    next" layout. Never overwrites a field already found on the medicine's
+    own line. Returns True if anything was actually merged (used to decide
+    whether continuing the bounded lookahead is still worthwhile).
+    """
+    merged = False
+    if pending["dosage"] == "N/A":
+        val = _extract_dosage(line_text)
+        if val != "N/A":
+            pending["dosage"] = val
+            merged = True
+    if pending["frequency"] == "N/A":
+        val = _extract_frequency(line_text)
+        if val != "N/A":
+            pending["frequency"] = val
+            merged = True
+    if pending["duration"] == "N/A":
+        val = _extract_duration(line_text)
+        if val != "N/A":
+            pending["duration"] = val
+            merged = True
+    if pending.get("strength_text", "N/A") == "N/A":
+        val = _extract_strength_text(line_text)
+        if val != "N/A":
+            pending["strength_text"] = val
+            merged = True
+    return merged
+
+
+def parse_medicines(
+    text: str, db: Session, ocr_lines: Optional[Sequence[OCRLine]] = None
+) -> List[Dict[str, Any]]:
+    """
+    Parse raw OCR text (or structured OCRLine data, when available) into a
+    structured list of medicines, matching names against the Postgres-
+    backed catalog via the Indian medicine normalization pipeline.
 
     Only confident matches (resolver status EXACT / HIGH_CONFIDENCE) are
-    emitted — REVIEW_REQUIRED, LOW_CONFIDENCE, and NO_MATCH tokens are all
-    silently skipped here, same as before, so uncertain matches are never
-    forced into the result.
+    emitted — REVIEW_REQUIRED, LOW_CONFIDENCE, and NO_MATCH spans are all
+    silently skipped, never forced into the result.
     """
-    if not text or not text.strip():
+    lines = _line_texts_and_confidence(text, ocr_lines)
+    if not lines:
         return []
 
     start = time.perf_counter()
-    lines = text.split("\n") if "\n" in text else _split_into_lines(text)
-
-    results = []
+    results: List[Dict[str, Any]] = []
     seen_names = set()
     stats: Dict[str, int] = {}
+    pending: Optional[Dict[str, Any]] = None
+    pending_lookahead_left = 0
 
-    for raw_line in lines:
-        if not raw_line.split():
+    for raw_line, line_confidence in lines:
+        if not raw_line or not raw_line.split():
             continue
 
-        line_clean = re.sub(r'[^A-Za-z0-9\s/\-\(\)\.]', ' ', raw_line)
-        line_clean = re.sub(r'\s+', ' ', line_clean).strip()
-
-        if len(line_clean) < 3:
+        words = _tokenize(raw_line)
+        if len(" ".join(words)) < 3:
             continue
 
-        words = line_clean.split()
-        match = None
+        line_matches = _scan_line_for_medicines(db, words, line_confidence, stats)
 
-        # For each starting word, try it together with the NEXT word first
-        # (e.g. "Dolo" + "680mg" -> "Dolo 680mg"), then the bare word alone.
-        # Order matters: resolving "Dolo" in isolation is blind to a
-        # strength sitting right next to it in the OCR text, which defeats
-        # the resolver's own strength-conflict safety check (found via a
-        # full-pipeline integration test: "Tab Dolo 680mg" was word-scanned
-        # as "Dolo" alone -> no strength to conflict with -> wrongly
-        # accepted as the 650mg product). If the combined phrase comes back
-        # REVIEW_REQUIRED with real candidates, that's a meaningful signal
-        # ("this clearly names something, but not safely") -- don't then
-        # fall back to the bare word, which would silently lose that signal
-        # and risk exactly the wrong-strength acceptance this exists to stop.
-        for idx, word in enumerate(words):
-            word_clean = _clean_word(word)
-            if _is_skip_token(word_clean):
-                continue
+        if not line_matches:
+            if pending is not None and pending_lookahead_left > 0:
+                _merge_instruction_only_line(pending, raw_line)
+                pending_lookahead_left -= 1
+            continue
 
-            blocked = False
-            if idx + 1 < len(words):
-                combined = f"{word_clean} {_clean_word(words[idx + 1])}".strip()
-                if combined != word_clean and not _is_skip_token(combined):
-                    result = resolve_medicine(db, combined)
-                    stats[result.status.value] = stats.get(result.status.value, 0) + 1
-                    if result.status in _CONFIDENT_STATUSES and result.matched is not None:
-                        match = result.matched
-                        break
-                    if result.status == MatchStatus.REVIEW_REQUIRED and result.candidates:
-                        blocked = True
-
-            if blocked:
-                continue
-
-            candidate = _confident_resolve(db, word_clean, stats)
-            if candidate is not None:
-                match = candidate
-                break
-
-        if match is not None:
-            med = match.medicine
-            # Invariant: `match` is only ever assigned from a candidate whose
-            # `.medicine` was already checked non-None (see the loops above).
+        for idx, (start_tok, end_tok, matched) in enumerate(line_matches):
+            med = matched.medicine
             assert med is not None
             name = med.brand_name or med.generic_name or (med.aliases[0] if med.aliases else None)
             if not name:
@@ -289,13 +485,25 @@ def parse_medicines(text: str, db: Session) -> List[Dict[str, Any]]:
             seen_names.add(name.lower())
             seen_names.add(root_name)
 
-            results.append({
+            window_end = line_matches[idx + 1][0] if idx + 1 < len(line_matches) else len(words)
+            window_text = " ".join(words[end_tok:window_end])
+            # A strength can legitimately be absorbed INTO the matched span
+            # itself (e.g. "Amoxycillin 500mg" resolves as one 2-token
+            # phrase via OCR correction) rather than trailing it -- check
+            # the matched span's own text too, not just what follows it.
+            # Dosage/frequency/duration are not at risk of this: those
+            # tokens (BD, 1-0-1, 5 days, ...) are noise-filtered and would
+            # never be absorbed into a resolved medicine-name span.
+            span_text = " ".join(words[start_tok:end_tok])
+            strength_source_text = f"{span_text} {window_text}".strip()
+
+            result = {
                 # Back-compat fields (previous API shape)
                 "name": name,
-                "confidence": round(match.confidence, 1),
-                "dosage": _extract_dosage(line_clean, name),
-                "frequency": _extract_frequency(line_clean, name),
-                "duration": _extract_duration(line_clean, name),
+                "confidence": round(matched.confidence, 1),
+                "dosage": _extract_dosage(window_text),
+                "frequency": _extract_frequency(window_text),
+                "duration": _extract_duration(window_text),
                 "raw_line": raw_line.strip(),
                 # Structured catalog fields
                 "id": str(med.id),
@@ -305,9 +513,25 @@ def parse_medicines(text: str, db: Session) -> List[Dict[str, Any]]:
                 "dosage_form": med.dosage_form,
                 "route": med.route,
                 "manufacturer": med.manufacturer,
-                "match_type": match.match_type,
+                "match_type": matched.match_type,
                 "source": med.source,
-            })
+                # New: strength genuinely re-detected from the OCR text
+                # (distinct from "dosage" — see _extract_strength_text),
+                # used by enervara_extraction_adapter.py as a fallback when
+                # the catalog row has no structured strength of its own.
+                "strength_text": _extract_strength_text(strength_source_text),
+                "ocr_confidence": line_confidence,
+                "overall_confidence": fuse_confidence(matched.confidence, line_confidence),
+            }
+            results.append(result)
+
+        last_result = results[-1] if results else None
+        if last_result is not None and last_result["dosage"] == "N/A" and last_result["frequency"] == "N/A" and last_result["duration"] == "N/A":
+            pending = last_result
+            pending_lookahead_left = _MAX_INSTRUCTION_LOOKAHEAD_LINES
+        else:
+            pending = None
+            pending_lookahead_left = 0
 
     elapsed_ms = (time.perf_counter() - start) * 1000
     logger.info(
@@ -321,24 +545,3 @@ def parse_medicines(text: str, db: Session) -> List[Dict[str, Any]]:
         elapsed_ms,
     )
     return results
-
-
-def _split_into_lines(text: str, words_per_line: int = 8) -> List[str]:
-    words = text.split()
-    lines = []
-    current = []
-
-    for word in words:
-        current.append(word)
-        chunk = " ".join(current)
-        has_dose = bool(re.search(r'\d+\s*(mg|ml|mcg)', chunk, re.IGNORECASE))
-        has_freq = any(re.search(r'\b' + k + r'\b', chunk.upper()) for k in FREQ_MAP)
-
-        if len(current) >= words_per_line or (has_dose and has_freq):
-            lines.append(chunk)
-            current = []
-
-    if current:
-        lines.append(" ".join(current))
-
-    return lines

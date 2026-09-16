@@ -65,18 +65,26 @@ def _medication_out(med: dict[str, Any]) -> MedicationOut:
     dosage = _clean(med.get("dosage"))
     duration_text = _clean(med.get("duration"))
     # Prefer the catalog's own structured strength (e.g. "650mg" on the
-    # matched product) over the OCR-line-regex dosage guess; fall back to
+    # matched product) over the OCR-line-regex strength guess; fall back to
     # the latter only when the catalog row has none (e.g. a generic-only
     # entry) -- still real, extracted-from-the-line text, not invented.
-    strength = med.get("strength") or dosage
+    # `strength_text` (NOT `dosage`) is the strength-shaped regex detector —
+    # they used to be the same field, which was a confirmed bug (a genuine
+    # administration-dosage phrase like "1 tablet" and a strength phrase
+    # like "500mg" are different concepts; see extraction/__init__.py).
+    strength = med.get("strength") or _clean(med.get("strength_text"))
 
-    confidence = med.get("confidence")
+    confidence = med.get("overall_confidence", med.get("confidence"))
     # This API's own scale is 0-100 everywhere else; Enervara's is 0-1
     # (MEDICATION_REVIEW_CONFIDENCE = 0.7 in its domain/types.ts). Sending
     # our raw 0-100 value would have Enervara's own clamp
     # (Math.min(1, Math.max(0, n))) flatten every real match to 1.0,
     # destroying the signal entirely -- this conversion is required, not
-    # cosmetic.
+    # cosmetic. Prefers `overall_confidence` (name-match fused with OCR read
+    # certainty, when available) over plain `confidence` so Enervara's own
+    # review-routing (MEDICATION_REVIEW_CONFIDENCE) actually reflects OCR
+    # uncertainty instead of a clean-looking match hiding a poor OCR read;
+    # identical to `confidence` whenever OCR-confidence context is absent.
     confidence_0_1 = round(confidence / 100.0, 3) if confidence is not None else None
 
     return MedicationOut(

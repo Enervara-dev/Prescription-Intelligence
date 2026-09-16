@@ -1,0 +1,43 @@
+{
+  "notes": "Synthetic multi-medicine page: three distinct rows, each with its own frequency/duration, verifying the span-based scanner is not limited to one medicine per line/page and that instructions are never cross-assigned between rows.",
+  "words": [
+    {"text": "Dolo", "confidence": 0.97, "x": 10, "y": 100, "width": 40, "height": 22},
+    {"text": "650", "confidence": 0.97, "x": 60, "y": 100, "width": 30, "height": 22},
+    {"text": "1-0-1", "confidence": 0.96, "x": 150, "y": 100, "width": 45, "height": 22},
+    {"text": "5", "confidence": 0.96, "x": 250, "y": 100, "width": 15, "height": 22},
+    {"text": "days", "confidence": 0.96, "x": 270, "y": 100, "width": 35, "height": 22},
+
+    {"text": "Pan", "confidence": 0.97, "x": 10, "y": 150, "width": 35, "height": 22},
+    {"text": "40", "confidence": 0.97, "x": 55, "y": 150, "width": 25, "height": 22},
+    {"text": "0-0-1", "confidence": 0.96, "x": 150, "y": 150, "width": 45, "height": 22},
+    {"text": "7", "confidence": 0.96, "x": 250, "y": 150, "width": 15, "height": 22},
+    {"text": "days", "confidence": 0.96, "x": 270, "y": 150, "width": 35, "height": 22},
+
+    {"text": "Amoxicillin", "confidence": 0.95, "x": 10, "y": 200, "width": 100, "height": 22},
+    {"text": "BD", "confidence": 0.95, "x": 150, "y": 200, "width": 25, "height": 22},
+    {"text": "7", "confidence": 0.95, "x": 250, "y": 200, "width": 15, "height": 22},
+    {"text": "days", "confidence": 0.95, "x": 270, "y": 200, "width": 35, "height": 22}
+  ],
+  "catalog": [
+    {
+      "external_id": "legacy:dolo-650", "brand_name": "Dolo 650", "generic_name": "Paracetamol",
+      "aliases": ["dolo", "dolo650", "dolo 650", "dolo-650"],
+      "strength": "650mg", "strength_value": 650, "strength_unit": "mg",
+      "dosage_form": "tablet", "source": "legacy_manual"
+    },
+    {
+      "external_id": "legacy:pan-40", "brand_name": "Pan 40", "generic_name": "Pantoprazole",
+      "aliases": ["pan", "pan40", "pan 40", "pan-40"],
+      "strength": "40mg", "strength_value": 40, "strength_unit": "mg",
+      "dosage_form": "tablet", "source": "legacy_manual"
+    },
+    {
+      "external_id": "legacy:amoxicillin", "generic_name": "Amoxicillin", "source": "legacy_manual"
+    }
+  ],
+  "expected_medicines": [
+    {"name": "Dolo 650", "strength": "650mg", "dosage": "N/A", "frequency": "1-0-1 (M-A-N)", "duration": "5 days"},
+    {"name": "Pan 40", "strength": "40mg", "dosage": "N/A", "frequency": "0-0-1 (M-A-N)", "duration": "7 days"},
+    {"name": "Amoxicillin", "strength": null, "dosage": "N/A", "frequency": "Twice Daily", "duration": "7 days"}
+  ]
+}

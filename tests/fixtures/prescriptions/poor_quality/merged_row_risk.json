@@ -1,0 +1,27 @@
+{
+  "notes": "Synthetic stand-in for a low-resolution/poorly-lit source: two real rows only 15px apart with 20px-tall words -- the exact geometry verified during the OCR forensic audit to merge into one garbled line under the previous fixed-18px-threshold implementation. This fixture exists to prove the resolution-adaptive grouping in ocr_geometry.py keeps them separate; it is NOT a measurement of real-world low-quality-image OCR accuracy.",
+  "words": [
+    {"text": "Dolo", "confidence": 0.93, "x": 10, "y": 100, "width": 40, "height": 20},
+    {"text": "650", "confidence": 0.90, "x": 60, "y": 102, "width": 30, "height": 20},
+    {"text": "1-0-1", "confidence": 0.88, "x": 120, "y": 101, "width": 45, "height": 20},
+    {"text": "AMOXICILLIN", "confidence": 0.85, "x": 10, "y": 115, "width": 100, "height": 20},
+    {"text": "500mg", "confidence": 0.82, "x": 120, "y": 116, "width": 45, "height": 20},
+    {"text": "7", "confidence": 0.80, "x": 220, "y": 115, "width": 15, "height": 20},
+    {"text": "days", "confidence": 0.80, "x": 240, "y": 115, "width": 35, "height": 20}
+  ],
+  "catalog": [
+    {
+      "external_id": "legacy:dolo-650", "brand_name": "Dolo 650", "generic_name": "Paracetamol",
+      "aliases": ["dolo", "dolo650", "dolo 650", "dolo-650"],
+      "strength": "650mg", "strength_value": 650, "strength_unit": "mg",
+      "dosage_form": "tablet", "source": "legacy_manual"
+    },
+    {
+      "external_id": "legacy:amoxicillin", "generic_name": "Amoxicillin", "source": "legacy_manual"
+    }
+  ],
+  "expected_medicines": [
+    {"name": "Dolo 650", "strength": "650mg", "dosage": "N/A", "frequency": "1-0-1 (M-A-N)", "duration": null},
+    {"name": "Amoxicillin", "strength": null, "dosage": "N/A", "frequency": "N/A", "duration": "7 days"}
+  ]
+}

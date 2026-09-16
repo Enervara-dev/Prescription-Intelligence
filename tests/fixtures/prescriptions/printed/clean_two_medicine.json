@@ -1,0 +1,33 @@
+{
+  "notes": "Synthetic stand-in for a clean, well-aligned printed prescription: consistent word heights, generous row spacing, uniformly high confidence. Does NOT validate real printed-prescription OCR accuracy -- no real image exists behind this fixture.",
+  "words": [
+    {"text": "Dolo", "confidence": 0.99, "x": 10, "y": 100, "width": 45, "height": 22},
+    {"text": "650", "confidence": 0.99, "x": 60, "y": 100, "width": 35, "height": 22},
+    {"text": "1-0-1", "confidence": 0.98, "x": 150, "y": 101, "width": 50, "height": 22},
+    {"text": "5", "confidence": 0.98, "x": 260, "y": 100, "width": 15, "height": 22},
+    {"text": "days", "confidence": 0.98, "x": 280, "y": 100, "width": 40, "height": 22},
+    {"text": "Pan", "confidence": 0.99, "x": 10, "y": 150, "width": 40, "height": 22},
+    {"text": "40", "confidence": 0.99, "x": 60, "y": 150, "width": 25, "height": 22},
+    {"text": "0-0-1", "confidence": 0.98, "x": 150, "y": 151, "width": 50, "height": 22},
+    {"text": "7", "confidence": 0.98, "x": 260, "y": 150, "width": 15, "height": 22},
+    {"text": "days", "confidence": 0.98, "x": 280, "y": 150, "width": 40, "height": 22}
+  ],
+  "catalog": [
+    {
+      "external_id": "legacy:dolo-650", "brand_name": "Dolo 650", "generic_name": "Paracetamol",
+      "aliases": ["dolo", "dolo650", "dolo 650", "dolo-650"],
+      "strength": "650mg", "strength_value": 650, "strength_unit": "mg",
+      "dosage_form": "tablet", "source": "legacy_manual"
+    },
+    {
+      "external_id": "legacy:pan-40", "brand_name": "Pan 40", "generic_name": "Pantoprazole",
+      "aliases": ["pan", "pan40", "pan 40", "pan-40"],
+      "strength": "40mg", "strength_value": 40, "strength_unit": "mg",
+      "dosage_form": "tablet", "source": "legacy_manual"
+    }
+  ],
+  "expected_medicines": [
+    {"name": "Dolo 650", "strength": "650mg", "dosage": "N/A", "frequency": "1-0-1 (M-A-N)", "duration": "5 days"},
+    {"name": "Pan 40", "strength": "40mg", "dosage": "N/A", "frequency": "0-0-1 (M-A-N)", "duration": "7 days"}
+  ]
+}

@@ -172,7 +172,13 @@ def test_parse_medicines_end_to_end_pipeline(db):
     assert dolo["source"] == "legacy_manual"
 
     amox = next(r for r in results if r["name"] == "Amoxicillin")
-    assert amox["dosage"] == "500mg"
+    # "dosage" now means genuine administration dosage (e.g. "1 tablet"),
+    # not strength -- "500mg" is a strength, correctly reported via
+    # "strength_text" instead. This line never states an actual dosage
+    # amount, so "dosage" is honestly "N/A" (see extraction/__init__.py,
+    # fixing a confirmed bug from the OCR/matching forensic audit).
+    assert amox["dosage"] == "N/A"
+    assert amox["strength_text"] == "500mg"
     assert amox["frequency"] == "Twice Daily"
 
 
