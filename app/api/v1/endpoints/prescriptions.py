@@ -29,7 +29,7 @@ from app.schemas.extract import ExtractRequest, PrescriptionExtractionOut
 from app.schemas.prescription import PrescriptionProcessResponse
 from app.services.enervara_extraction_adapter import build_extraction
 from app.services.extraction import parse_medicines
-from app.services.ocr_service import extract_text_from_images
+from app.services.ocr_service import OCRProviderError, extract_text_from_images
 from app.utils import download_document, file_bytes_to_pil_images, validate_file_size, validate_file_type
 
 logger = logging.getLogger(__name__)
@@ -150,6 +150,15 @@ async def process_prescription(
 
     except HTTPException:
         raise
+    except OCRProviderError as exc:
+        # Distinct from every other failure mode: the OCR provider itself
+        # (Google Vision) could not be reached/used after retries, as
+        # opposed to a successful OCR call finding nothing (not an error —
+        # returns 200 with an empty medicines list) or some other bug in
+        # this service's own processing. 503 signals "try again shortly" —
+        # a 500 doesn't tell the caller whether retrying could help.
+        logger.error(f"OCR provider unavailable: {exc}", exc_info=True)
+        raise HTTPException(503, "Prescription OCR service is temporarily unavailable. Please try again shortly.")
     except Exception as exc:
         # Full detail (which may reference internal hosts, DB/Vision error
         # bodies, etc.) goes to the server log only — never back to the
@@ -214,6 +223,15 @@ async def extract_prescription(
 
     except HTTPException:
         raise
+    except OCRProviderError as exc:
+        # See the matching handler in process_prescription() above — distinct
+        # from a generic processing failure. Enervara's own client treats
+        # any non-2xx uniformly (see httpProcessingService.ts), so this
+        # doesn't change what Enervara's caller sees; it makes our own logs
+        # and any other direct caller of this endpoint able to tell "OCR
+        # provider down" apart from "something else broke."
+        logger.error("[extract] request_id=%s OCR provider unavailable: %s", payload.request_id, exc, exc_info=True)
+        raise HTTPException(503, "Prescription OCR service is temporarily unavailable. Please try again shortly.")
     except Exception as exc:
         logger.error("[extract] request_id=%s processing failed: %s", payload.request_id, exc, exc_info=True)
         raise HTTPException(502, "Processing failed.")
