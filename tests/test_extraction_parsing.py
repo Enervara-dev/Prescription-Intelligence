@@ -211,3 +211,126 @@ def test_plain_triad_frequency(catalog):
     ]:
         results = parse_medicines(text, catalog)
         assert results[0]["frequency"] == expected, text
+
+
+# -- Regressions found via a real printed prescription (table layout with --
+# -- composition sub-lines, "N Morning"/"N Night" notation, and a total-  --
+# -- quantity "(Tot:N Tab)" column, distinct from every synthetic case    --
+# -- above) --------------------------------------------------------------
+
+def test_morning_night_notation_reports_twice_daily(catalog):
+    """"1 Morning, 1 Night (After Food)" states a twice-daily schedule.
+    Verified bug: matching "After Food" first reported frequency as "After
+    Meals" and silently dropped the actual dosing schedule."""
+    results = parse_medicines("Dolo 650 1 Morning, 1 Night (After Food) 8 Days", catalog)
+    assert results[0]["frequency"] == "Twice Daily (Morning, Night)"
+    assert results[0]["duration"] == "8 Days"
+
+
+def test_morning_only_notation_reports_morning_not_after_food(catalog):
+    results = parse_medicines("Dolo 650 1 Morning (After Food) 5 days", catalog)
+    assert results[0]["frequency"] == "Morning"
+
+
+def test_meal_timing_alone_still_reported_as_last_resort(catalog):
+    """When nothing else describes frequency, the meal-timing keyword is
+    still real information and should still be reported -- it's only
+    deprioritized behind a genuine frequency signal, never dropped
+    entirely."""
+    results = parse_medicines("Dolo 650 After Food 5 days", catalog)
+    assert results[0]["frequency"] == "After Meals"
+
+
+def test_total_quantity_notation_never_becomes_dosage(catalog):
+    """"(Tot:8 Tab)" states the TOTAL quantity to dispense across the whole
+    course (frequency x duration), not a per-administration amount.
+    Verified bug: this was reported as dosage="8 Tab", implying "take 8
+    tablets per dose"."""
+    results = parse_medicines("Dolo 650 1 Morning 8 Days (Tot:8 Tab)", catalog)
+    assert results[0]["dosage"] == "N/A"
+    assert results[0]["duration"] == "8 Days"
+
+
+def test_genuine_dosage_still_extracted_alongside_total_quantity(catalog):
+    results = parse_medicines("Dolo 650 1 tablet Morning 8 Days (Tot:8 Tab)", catalog)
+    assert results[0]["dosage"] == "1 tablet"
+
+
+def test_unrecognized_medicine_row_does_not_leak_into_a_preceding_ingredient_match(catalog):
+    """
+    Real-world regression: a combination drug's composition sub-line lists
+    a recognized generic ingredient (here, an existing catalog entry) with
+    no dosage/frequency/duration of its own on that line. The FOLLOWING
+    line is a different, unrelated medicine's row that isn't in the catalog
+    (so it produces no match) -- it must NOT be mistaken for a pure
+    instruction continuation of the ingredient match above it, and its
+    dosage/frequency/duration must never leak across.
+    """
+    repo.upsert_medicine(catalog, {
+        "external_id": "legacy:folic-acid",
+        "generic_name": "Folic Acid", "source": "legacy_manual",
+    })
+    catalog.commit()
+
+    text = (
+        "TAB. VOMILAST 1 Morning, 1 Night (After Food) 8 Days (Tot:16 Tab)\n"
+        "DOXYLAMINE 10MG + PYRIDOXINE 10 MG + FOLIC ACID 2.5 MG\n"
+        "CAP. ZOCLAR 500 1 Morning 3 Days (Tot:3 Cap)\n"
+        "CLARITHROMYCIN IP 500MG\n"
+    )
+    results = parse_medicines(text, catalog)
+    names = {r["name"]: r for r in results}
+    assert set(names) == {"Folic Acid"}
+    folic = names["Folic Acid"]
+    # Must stay honestly empty, not stolen from the unrelated Zoclar row.
+    assert folic["dosage"] == "N/A"
+    assert folic["frequency"] == "N/A"
+    assert folic["duration"] == "N/A"
+
+
+def test_real_prescription_sample_end_to_end(catalog):
+    """
+    Full transcription of a real (sample/synthetic, non-PHI) printed
+    prescription shared for testing: a proper table with composition
+    sub-lines, none of whose 4 medicines exist in this catalog. Verifies
+    the whole pipeline behaves safely on realistic input it was never
+    tuned against: recognized ingredients from an unrecognized combination
+    drug are found without fabricating the unrecognized brand, and no
+    unrelated row's instructions leak across.
+    """
+    repo.upsert_medicine(catalog, {
+        "external_id": "legacy:folic-acid",
+        "generic_name": "Folic Acid", "source": "legacy_manual",
+    })
+    repo.upsert_medicine(catalog, {
+        "external_id": "legacy:pyridoxine",
+        "generic_name": "Pyridoxine", "source": "legacy_manual",
+    })
+    repo.upsert_medicine(catalog, {
+        "external_id": "legacy:clarithromycin",
+        "generic_name": "Clarithromycin", "source": "legacy_manual",
+    })
+    catalog.commit()
+
+    text = (
+        "TAB. ABCIXIMAB 1 Morning 8 Days (Tot:8 Tab)\n"
+        "TAB. VOMILAST 1 Morning, 1 Night (After Food) 8 Days (Tot:16 Tab)\n"
+        "DOXYLAMINE 10MG + PYRIDOXINE 10 MG + FOLIC ACID 2.5 MG\n"
+        "CAP. ZOCLAR 500 1 Morning 3 Days (Tot:3 Cap)\n"
+        "CLARITHROMYCIN IP 500MG\n"
+        "TAB. GESTAKIND 10/SR 1 Night 4 Days (Tot:4 Tab)\n"
+        "ISOXSURINE 10 MG\n"
+    )
+    results = parse_medicines(text, catalog)
+    names = {r["name"]: r for r in results}
+
+    # Abciximab/Vomilast/Zoclar/Gestakind are not in the catalog -- correctly
+    # absent, never fabricated or force-matched to something else.
+    assert "Abciximab" not in names
+    assert set(names) == {"Pyridoxine", "Folic Acid", "Clarithromycin"}
+
+    # None of the recognized ingredients inherit another row's instructions.
+    for name, med in names.items():
+        assert med["dosage"] == "N/A", name
+        assert med["frequency"] == "N/A", name
+        assert med["duration"] == "N/A", name

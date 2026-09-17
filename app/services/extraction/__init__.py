@@ -134,6 +134,15 @@ _DOSAGE_RE = re.compile(
     r"(tablets?|tabs?|capsules?|caps?|drops?|puffs?|spoons?|tsp|teaspoons?)\b",
     re.IGNORECASE,
 )
+# "(Tot:8 Tab)" / "(Total: 16 Tab)" states the TOTAL quantity to dispense
+# across the whole course (frequency x duration), not a per-administration
+# amount -- a real, verified bug (found via a real prescription): without
+# stripping this first, _DOSAGE_RE matched "8 Tab" out of "(Tot:8 Tab)" and
+# reported it as the dosage, implying "take 8 tablets per dose" when the
+# text actually means 1 per dose, 8 total. Stripped before dosage
+# extraction only; duration/frequency/strength text were verified
+# unaffected by this pattern.
+_TOTAL_QUANTITY_RE = re.compile(r"\(?\s*tot(?:al)?\s*[:.]?\s*\d+\s*\w*\)?", re.IGNORECASE)
 
 
 def _clean_word(word: str) -> str:
@@ -214,6 +223,7 @@ def _extract_dosage(text: str) -> str:
     — returning "N/A" in that case is the honest answer, not a gap to guess
     around.
     """
+    text = _TOTAL_QUANTITY_RE.sub(" ", text)
     match = _DOSAGE_RE.search(text)
     return match.group(0).strip() if match else "N/A"
 
@@ -229,9 +239,25 @@ def _extract_duration(text: str) -> str:
     return match.group(0).strip() if match else "N/A"
 
 
+_TIMING_ONLY_KEYS = ("AFTER FOOD", "BEFORE FOOD")
+
+
 def _extract_frequency(text: str) -> str:
+    """
+    Priority order is deliberate: genuine frequency signals (how many times
+    a day) are checked BEFORE meal-timing qualifiers (when relative to a
+    meal) — a real, verified bug (found via a real prescription using "1
+    Morning, 1 Night (After Food)" notation): matching "After Food" first
+    reported frequency as "After Meals" and silently discarded the actual
+    twice-daily schedule stated in the same text. Meal timing and dosing
+    frequency are different concepts; meal-timing keywords are checked only
+    as a last resort, when nothing else in the text describes frequency.
+    """
     upper = text.upper()
+
     for key, value in FREQ_MAP.items():
+        if key in _TIMING_ONLY_KEYS:
+            continue
         if re.search(r'\b' + re.escape(key) + r'\b', upper):
             return value
 
@@ -253,12 +279,32 @@ def _extract_frequency(text: str) -> str:
             return '1' if c.lower() in ('1', 't', 'l', 'i') else '0'
         return f"{norm_d(m_opt.group(1))}-{norm_d(m_opt.group(2))}-{norm_d(m_opt.group(3))} (M-A-N)"
 
-    m_time = re.search(r'\b(\d{1,2}\s*(?:AM|PM)|bedtime|morning|night|ep|evening)\b', text, re.IGNORECASE)
-    if m_time:
-        t = m_time.group(0).strip()
-        if t.lower() == 'ep':
-            return "Evening"
-        return t.capitalize()
+    # Time-of-day words used AS the schedule itself (e.g. "1 Morning, 1
+    # Night"). Both morning and night present means twice daily; report
+    # exactly what's present, never inferring a third dose that wasn't
+    # stated.
+    has_morning = bool(re.search(r'\bmorning\b', text, re.IGNORECASE))
+    has_night = bool(re.search(r'\bnight\b|\bbedtime\b', text, re.IGNORECASE))
+    has_evening = bool(re.search(r'\bevening\b|\bep\b', text, re.IGNORECASE))
+    if has_morning and has_night:
+        return "Twice Daily (Morning, Night)"
+    if has_morning:
+        return "Morning"
+    if has_night:
+        return "Night"
+    if has_evening:
+        return "Evening"
+
+    m_ampm = re.search(r'\b\d{1,2}\s*(?:AM|PM)\b', text, re.IGNORECASE)
+    if m_ampm:
+        return m_ampm.group(0).strip().upper()
+
+    # Meal-timing keywords, as an actual last resort: real information (when
+    # to take it relative to a meal), just never a substitute for a
+    # frequency signal that's also present elsewhere in the same text.
+    for key in _TIMING_ONLY_KEYS:
+        if re.search(r'\b' + key + r'\b', upper):
+            return FREQ_MAP[key]
 
     m_dashes = re.search(r'\b\d\s*-\s*\d\b', text)
     if m_dashes:
@@ -398,6 +444,27 @@ def _line_texts_and_confidence(
     return [(line, None) for line in text.split("\n")]
 
 
+def _is_pure_instruction_line(words: List[str]) -> bool:
+    """
+    True only if EVERY token on the line is noise-shaped (a stopword, a
+    bare number, a frequency/duration pattern, a dosage-form word) -- i.e.
+    the line could not possibly contain a medicine name, recognized or not.
+
+    This gates the cross-line instruction-lookahead merge (see
+    parse_medicines): a line that produced zero medicine MATCHES is not the
+    same thing as a line that could not possibly CONTAIN one. A line like
+    "CAP. ZOCLAR 500 1 Morning 3 Days" produces no match when "Zoclar 500"
+    isn't in the catalog -- but "ZOCLAR" is a real leftover content word,
+    not noise, so this is that medicine's OWN unrecognized row, not a
+    continuation of the previous medicine's instructions. Verified bug: a
+    real prescription with a combination drug's composition sub-line
+    (recognized ingredients, unrecognized brand) followed by another
+    unrecognized medicine's row caused that row's dosage/frequency/duration
+    to be wrongly merged into the earlier, unrelated ingredient match.
+    """
+    return all(_is_noise_token(w) for w in words)
+
+
 def _merge_instruction_only_line(pending: Dict[str, Any], line_text: str) -> bool:
     """
     Fills in whichever of dosage/frequency/duration `pending` is still
@@ -465,9 +532,21 @@ def parse_medicines(
         line_matches = _scan_line_for_medicines(db, words, line_confidence, stats)
 
         if not line_matches:
-            if pending is not None and pending_lookahead_left > 0:
+            if (
+                pending is not None
+                and pending_lookahead_left > 0
+                and _is_pure_instruction_line(words)
+            ):
                 _merge_instruction_only_line(pending, raw_line)
                 pending_lookahead_left -= 1
+            else:
+                # A line with no medicine MATCH but real leftover content
+                # words (e.g. an unrecognized brand name) is that row's own
+                # unrelated content, not a continuation of the previous
+                # medicine -- stop the lookahead rather than risk merging
+                # the wrong row's instructions into it.
+                pending = None
+                pending_lookahead_left = 0
             continue
 
         for idx, (start_tok, end_tok, matched) in enumerate(line_matches):
