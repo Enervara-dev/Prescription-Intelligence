@@ -39,8 +39,34 @@ logger = logging.getLogger(__name__)
 
 # Bounded retry for the Gemini call itself -- covers a transient network
 # blip or a momentary provider hiccup, not a permanent misconfiguration.
-_MAX_GEMINI_ATTEMPTS = 3
-_GEMINI_RETRY_BACKOFF_SECONDS = (1.0, 2.0)  # delay before attempt 2 and attempt 3
+# Worst-case latency budget is deliberately kept well under Enervara's own
+# hard deadline for the whole /extract call (RX_PROCESSING_TIMEOUT_MS,
+# default 90s in prod_app/backend/src/prescriptions/processing/
+# httpProcessingService.ts, via AbortSignal.timeout -- a total-elapsed-time
+# deadline, not an idle-connection timeout, so it fires regardless of
+# whether the response arrives all at once or streamed). A retry does not
+# reduce latency for a call that's merely slow rather than failing outright
+# -- it can only make total latency worse -- so this stays at 2 attempts,
+# not more: 2 x _GEMINI_REQUEST_TIMEOUT_MS + backoff is the real worst case.
+_MAX_GEMINI_ATTEMPTS = 2
+_GEMINI_RETRY_BACKOFF_SECONDS = (1.0,)  # delay before attempt 2
+# Per-attempt timeout: without this, a single slow/hanging call has no
+# bound of its own and can consume the entire retry budget by itself
+# (verified gap -- previously unset). 30s is generous for a single
+# prescription image at the resolution cap below, while keeping
+# 2 x 30s + 1s backoff = 61s comfortably under the 90s external deadline.
+_GEMINI_REQUEST_TIMEOUT_MS = 30_000
+# Caps worst-case generation time/cost and gives a second, independent
+# bound alongside the request timeout above. Generous enough for a page
+# with many medicines plus the full_text transcription; not unlimited.
+_GEMINI_MAX_OUTPUT_TOKENS = 8192
+# Long-edge cap before sending to Gemini. A modern phone photo is often
+# 3000-4000px+ on the long edge (several MB) -- full resolution buys
+# nothing for OCR-quality text legibility beyond this, but directly adds to
+# upload time and Gemini's own processing time. 2048px keeps text easily
+# legible (well above what a genuinely low-quality/blurry source needs)
+# while cutting typical upload size substantially.
+_GEMINI_MAX_IMAGE_DIMENSION = 2048
 
 
 class GeminiProviderError(Exception):
@@ -207,10 +233,25 @@ def _require_api_key() -> str:
     return key
 
 
+def _downscale(img: Image.Image, max_dimension: int = _GEMINI_MAX_IMAGE_DIMENSION) -> Image.Image:
+    """Shrinks (never enlarges) an image so its longer edge is at most
+    `max_dimension`, preserving aspect ratio. A real, measured latency
+    contributor: an unscaled multi-megapixel phone photo adds upload time
+    and Gemini-side processing time with no legibility benefit beyond this
+    resolution."""
+    width, height = img.size
+    longest = max(width, height)
+    if longest <= max_dimension:
+        return img
+    scale = max_dimension / longest
+    return img.resize((round(width * scale), round(height * scale)), Image.Resampling.LANCZOS)
+
+
 def _pil_images_to_parts(images: List[Image.Image]) -> List[types.Part]:
     parts = []
     for img in images:
         rgb = img.convert("RGB") if img.mode != "RGB" else img
+        rgb = _downscale(rgb)
         buf = io.BytesIO()
         rgb.save(buf, format="JPEG", quality=90)
         parts.append(types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg"))
@@ -233,6 +274,8 @@ def _call_gemini_with_retry(images: List[Image.Image]) -> GeminiExtraction:
     config = types.GenerateContentConfig(
         response_mime_type="application/json",
         response_schema=GeminiExtraction,
+        max_output_tokens=_GEMINI_MAX_OUTPUT_TOKENS,
+        http_options=types.HttpOptions(timeout=_GEMINI_REQUEST_TIMEOUT_MS),
     )
 
     last_exc: Optional[Exception] = None

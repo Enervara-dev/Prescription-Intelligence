@@ -75,26 +75,31 @@ def _tiny_image():
 
 # -- Retry / error signal ----------------------------------------------------
 
-def test_retry_succeeds_after_transient_failures(monkeypatch):
+def test_retry_succeeds_after_transient_failure(monkeypatch):
     success = _FakeResponse(parsed=GeminiExtraction(full_text="ok"))
     models = _install_fake_client(monkeypatch, [
-        ConnectionError("simulated transient failure"),
         ConnectionError("simulated transient failure"),
         success,
     ])
     result = gemini_extraction.extract_prescription([_tiny_image()])
     assert result.full_text == "ok"
-    assert models.calls == 3
+    assert models.calls == 2
 
 
 def test_retry_gives_up_after_max_attempts_and_raises_distinct_error(monkeypatch):
-    _install_fake_client(monkeypatch, [
-        ConnectionError("persistent failure"),
+    """
+    Only 2 attempts, not 3 -- a retry cannot reduce latency for a call that
+    is merely slow rather than failing outright, so the retry budget is
+    deliberately kept small to keep worst-case total latency well under
+    Enervara's own 90s deadline (see _MAX_GEMINI_ATTEMPTS docstring).
+    """
+    models = _install_fake_client(monkeypatch, [
         ConnectionError("persistent failure"),
         ConnectionError("persistent failure"),
     ])
     with pytest.raises(GeminiProviderError) as exc_info:
         gemini_extraction.extract_prescription([_tiny_image()])
+    assert models.calls == 2
     assert "persistent failure" in str(exc_info.value.__cause__)
 
 
@@ -102,11 +107,10 @@ def test_unparseable_response_is_treated_as_a_failure_and_retried(monkeypatch):
     models = _install_fake_client(monkeypatch, [
         _FakeResponse(parsed=None),
         _FakeResponse(parsed=None),
-        _FakeResponse(parsed=None),
     ])
     with pytest.raises(GeminiProviderError):
         gemini_extraction.extract_prescription([_tiny_image()])
-    assert models.calls == 3
+    assert models.calls == 2
 
 
 def test_permanent_config_error_is_not_retried(monkeypatch):
@@ -122,6 +126,63 @@ def test_permanent_config_error_is_not_retried(monkeypatch):
     with pytest.raises(EnvironmentError):
         gemini_extraction.extract_prescription([_tiny_image()])
     assert calls == []  # never even tried to construct a client
+
+
+# -- Latency: per-request timeout, output cap, image downscaling ------------
+
+def test_request_has_a_per_attempt_timeout_and_output_cap(monkeypatch):
+    """
+    A single hung/slow attempt must not be able to consume the whole retry
+    budget unbounded -- verified gap, previously unset entirely.
+    """
+    captured_configs = []
+
+    class _CapturingModels:
+        def generate_content(self, model, contents, config):
+            captured_configs.append(config)
+            return _FakeResponse(parsed=GeminiExtraction(full_text="ok"))
+
+    class _FakeClient:
+        def __init__(self, api_key=None):
+            self.models = _CapturingModels()
+
+    monkeypatch.setattr(gemini_extraction.genai, "Client", _FakeClient)
+    gemini_extraction.extract_prescription([_tiny_image()])
+
+    assert len(captured_configs) == 1
+    config = captured_configs[0]
+    assert config.http_options is not None
+    assert config.http_options.timeout == gemini_extraction._GEMINI_REQUEST_TIMEOUT_MS
+    assert config.max_output_tokens == gemini_extraction._GEMINI_MAX_OUTPUT_TOKENS
+
+
+def test_worst_case_retry_latency_budget_is_conservative():
+    """
+    Guards the actual latency math, not just the individual numbers: total
+    worst-case time (attempts x per-attempt timeout + backoff) must stay
+    comfortably under Enervara's 90s deadline (see module comment on
+    _MAX_GEMINI_ATTEMPTS) -- with real margin for image download and other
+    endpoint overhead that happens outside this function.
+    """
+    worst_case_seconds = (
+        gemini_extraction._MAX_GEMINI_ATTEMPTS * (gemini_extraction._GEMINI_REQUEST_TIMEOUT_MS / 1000)
+        + sum(gemini_extraction._GEMINI_RETRY_BACKOFF_SECONDS)
+    )
+    assert worst_case_seconds <= 70  # well under the 90s external deadline
+
+
+def test_large_image_is_downscaled():
+    big = Image.new("RGB", (4000, 3000), color="white")
+    small = gemini_extraction._downscale(big)
+    assert max(small.size) == gemini_extraction._GEMINI_MAX_IMAGE_DIMENSION
+    # Aspect ratio preserved.
+    assert small.size[0] / small.size[1] == pytest.approx(4000 / 3000, rel=0.01)
+
+
+def test_small_image_is_not_upscaled():
+    small = Image.new("RGB", (400, 300), color="white")
+    result = gemini_extraction._downscale(small)
+    assert result.size == (400, 300)
 
 
 # -- Mapping into existing response schemas ----------------------------------
