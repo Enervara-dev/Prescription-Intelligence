@@ -73,44 +73,33 @@ def _tiny_image():
     return Image.new("RGB", (10, 10), color="white")
 
 
-# -- Retry / error signal ----------------------------------------------------
+# -- Single attempt / error signal -------------------------------------------
+# No retry -- see _MAX_GEMINI_ATTEMPTS docstring: verified empirically
+# against the live deployment that a short per-attempt timeout combined
+# with a retry made things WORSE (Gemini's own servers started returning
+# 504 DEADLINE_EXCEEDED consistently for a call that had previously
+# succeeded, once a tight timeout was introduced). Retrying a call that
+# needs more time doesn't help -- it just repeats the same wait -- so a
+# single, more generously-bounded attempt is the safer trade: predictable
+# worst-case latency over resilience to a rare transient blip.
 
-def test_retry_succeeds_after_transient_failure(monkeypatch):
-    success = _FakeResponse(parsed=GeminiExtraction(full_text="ok"))
+def test_single_failure_raises_distinct_error_with_no_retry(monkeypatch):
     models = _install_fake_client(monkeypatch, [
-        ConnectionError("simulated transient failure"),
-        success,
-    ])
-    result = gemini_extraction.extract_prescription([_tiny_image()])
-    assert result.full_text == "ok"
-    assert models.calls == 2
-
-
-def test_retry_gives_up_after_max_attempts_and_raises_distinct_error(monkeypatch):
-    """
-    Only 2 attempts, not 3 -- a retry cannot reduce latency for a call that
-    is merely slow rather than failing outright, so the retry budget is
-    deliberately kept small to keep worst-case total latency well under
-    Enervara's own 90s deadline (see _MAX_GEMINI_ATTEMPTS docstring).
-    """
-    models = _install_fake_client(monkeypatch, [
-        ConnectionError("persistent failure"),
-        ConnectionError("persistent failure"),
+        ConnectionError("simulated failure"),
     ])
     with pytest.raises(GeminiProviderError) as exc_info:
         gemini_extraction.extract_prescription([_tiny_image()])
-    assert models.calls == 2
-    assert "persistent failure" in str(exc_info.value.__cause__)
+    assert models.calls == 1  # no second attempt
+    assert "simulated failure" in str(exc_info.value.__cause__)
 
 
-def test_unparseable_response_is_treated_as_a_failure_and_retried(monkeypatch):
+def test_unparseable_response_is_treated_as_a_failure(monkeypatch):
     models = _install_fake_client(monkeypatch, [
-        _FakeResponse(parsed=None),
         _FakeResponse(parsed=None),
     ])
     with pytest.raises(GeminiProviderError):
         gemini_extraction.extract_prescription([_tiny_image()])
-    assert models.calls == 2
+    assert models.calls == 1
 
 
 def test_permanent_config_error_is_not_retried(monkeypatch):
@@ -168,7 +157,9 @@ def test_worst_case_retry_latency_budget_is_conservative():
         gemini_extraction._MAX_GEMINI_ATTEMPTS * (gemini_extraction._GEMINI_REQUEST_TIMEOUT_MS / 1000)
         + sum(gemini_extraction._GEMINI_RETRY_BACKOFF_SECONDS)
     )
-    assert worst_case_seconds <= 70  # well under the 90s external deadline
+    # Real margin under the 90s external deadline for image download and
+    # other endpoint overhead (not just this function's own call).
+    assert worst_case_seconds <= 80
 
 
 def test_large_image_is_downscaled():
