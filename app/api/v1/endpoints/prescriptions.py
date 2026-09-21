@@ -1,16 +1,20 @@
 """
 api/v1/endpoints/prescriptions.py
 -----------------------------------
-POST /process  — the existing multipart OCR pipeline endpoint: upload a
-                  prescription image/PDF, get back structured patient info +
-                  medicine data. UNCHANGED by the addition below.
+POST /process  — upload a prescription image/PDF, get back structured
+                  patient info + medicine data.
 POST /extract  — service-to-service adapter for Enervara's
                   HttpPrescriptionProcessingService: accepts Enervara's JSON
                   contract (a document_url, not file bytes) and returns
-                  Enervara's PrescriptionExtraction shape. Reuses the exact
-                  same OCR + parse_medicines() pipeline as /process — see
-                  app/services/enervara_extraction_adapter.py for the (only
-                  new) output-shape transform.
+                  Enervara's PrescriptionExtraction shape.
+
+Both now use Gemini (app/services/gemini_extraction.py) directly for image
+-> structured-data extraction, with no Postgres-catalog cross-reference or
+fuzzy matching involved — per explicit instruction, the previous Vision-OCR
++ medicine_resolver pipeline is no longer called from either endpoint. That
+code (app/services/ocr_service.py, app/services/extraction/__init__.py,
+app/services/medicine_resolver.py, app/services/enervara_extraction_adapter.py)
+is left in place, fully tested, and importable if this needs to be reverted.
 """
 
 import base64
@@ -21,15 +25,17 @@ import time
 
 from fastapi import APIRouter, Depends, File, Header, HTTPException, UploadFile
 from PIL import Image
-from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.db.session import get_db
 from app.schemas.extract import ExtractRequest, PrescriptionExtractionOut
 from app.schemas.prescription import PrescriptionProcessResponse
-from app.services.enervara_extraction_adapter import build_extraction
-from app.services.extraction import parse_medicines
-from app.services.ocr_service import OCRProviderError, extract_text_from_images
+from app.services.gemini_extraction import (
+    GeminiProviderError,
+    extract_prescription as gemini_extract_prescription,
+    to_extraction_out,
+    to_patient_info_text,
+    to_process_medicines,
+)
 from app.utils import download_document, file_bytes_to_pil_images, validate_file_size, validate_file_type
 
 logger = logging.getLogger(__name__)
@@ -47,25 +53,6 @@ def _pil_to_base64_jpeg(img: Image.Image, max_size=(900, 1200)) -> str:
     thumb.save(buf, format="JPEG", quality=85)
     b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
     return f"data:image/jpeg;base64,{b64}"
-
-
-def _clean_patient_info(ocr_result: dict, medicines: list[dict]) -> str:
-    """
-    Drop lines from the OCR-detected patient-info block that actually turned
-    out to be medicine lines (already captured in `medicines`), so they
-    aren't duplicated. Shared by /process and /extract — was inline in
-    /process only before /extract needed the identical logic.
-    """
-    raw_med_lines = {m.get("raw_line", "").strip() for m in medicines if m.get("raw_line")}
-    clean_lines = []
-    for line in ocr_result.get("patient_info", "").split("\n"):
-        line_str = line.strip()
-        if not line_str or line_str in raw_med_lines:
-            continue
-        if any(m["name"].split()[0].lower() in line_str.lower() for m in medicines):
-            continue
-        clean_lines.append(line_str)
-    return "\n".join(clean_lines) if clean_lines else "Patient details not detected clearly."
 
 
 def verify_service_api_key(x_api_key: str | None = Header(default=None)) -> None:
@@ -91,16 +78,13 @@ def verify_service_api_key(x_api_key: str | None = Header(default=None)) -> None
 )
 async def process_prescription(
     file: UploadFile = File(...),
-    db: Session = Depends(get_db),
 ) -> PrescriptionProcessResponse:
     """
     Upload a prescription image (JPEG/PNG/WEBP/BMP/TIFF) or PDF.
 
-    Runs OCR (Google Cloud Vision), classifies text into patient info vs.
-    medicine lines, and matches medicine names against the Postgres-backed
-    catalog (indexed pg_trgm search + OCR-confusable correction) to return
-    structured medicine entries (name, strength, dosage form, match type,
-    dosage/frequency/duration, confidence).
+    Sends the image(s) directly to Gemini, which returns structured medicine
+    data (name, strength, dosage, frequency, duration, confidence) — no
+    Postgres-catalog cross-reference or fuzzy matching involved.
     """
     validate_file_type(file.content_type)
     image_bytes = await file.read()
@@ -112,55 +96,41 @@ async def process_prescription(
 
     start = time.perf_counter()
     try:
-        # 1. OCR + Auto-Orientation + Categorisation
-        ocr_result = extract_text_from_images(pil_images)
+        result = gemini_extract_prescription(pil_images)
+        medicines = to_process_medicines(result)
+        patient_info = to_patient_info_text(result)
 
-        # 2. Parse medicines from medicine text, fallback to full text if
-        # needed. `medicine_ocr_lines` (when present) carries per-word
-        # geometry/confidence through to the resolver -- see
-        # app/services/extraction/__init__.py and ocr_geometry.py.
-        medicines = parse_medicines(
-            ocr_result["medicine_text"], db, ocr_lines=ocr_result.get("medicine_ocr_lines")
-        )
-        if not medicines and ocr_result["full_text"]:
-            medicines = parse_medicines(ocr_result["full_text"], db, ocr_lines=ocr_result.get("all_ocr_lines"))
-
-        final_patient_info = _clean_patient_info(ocr_result, medicines)
-
-        # 3. Create visual preview from first properly oriented page
-        image_preview = None
-        if ocr_result.get("oriented_images"):
-            image_preview = _pil_to_base64_jpeg(ocr_result["oriented_images"][0])
+        image_preview = _pil_to_base64_jpeg(pil_images[0]) if pil_images else None
 
         elapsed = round(time.perf_counter() - start, 2)
 
         return PrescriptionProcessResponse(
             success=True,
             filename=file.filename,
-            patient_info=final_patient_info,
+            patient_info=patient_info,
             medicines=medicines,
             image_preview=image_preview,
             processing_time_sec=elapsed,
             debug={
-                "full_text": ocr_result["full_text"],
-                "medicine_text": ocr_result["medicine_text"],
-                "word_count": ocr_result["word_count"],
+                "full_text": result.full_text,
+                "medicine_text": result.full_text,
+                "word_count": len(result.full_text.split()),
             },
         )
 
     except HTTPException:
         raise
-    except OCRProviderError as exc:
-        # Distinct from every other failure mode: the OCR provider itself
-        # (Google Vision) could not be reached/used after retries, as
-        # opposed to a successful OCR call finding nothing (not an error —
+    except GeminiProviderError as exc:
+        # Distinct from every other failure mode: the extraction provider
+        # itself (Gemini) could not be reached/used after retries, as
+        # opposed to a successful call finding nothing (not an error —
         # returns 200 with an empty medicines list) or some other bug in
         # this service's own processing. 503 signals "try again shortly" —
         # a 500 doesn't tell the caller whether retrying could help.
-        logger.error(f"OCR provider unavailable: {exc}", exc_info=True)
-        raise HTTPException(503, "Prescription OCR service is temporarily unavailable. Please try again shortly.")
+        logger.error(f"Extraction provider unavailable: {exc}", exc_info=True)
+        raise HTTPException(503, "Prescription extraction service is temporarily unavailable. Please try again shortly.")
     except Exception as exc:
-        # Full detail (which may reference internal hosts, DB/Vision error
+        # Full detail (which may reference internal hosts, provider error
         # bodies, etc.) goes to the server log only — never back to the
         # caller, who gets a generic message instead.
         logger.error(f"Processing failed: {exc}", exc_info=True)
@@ -176,18 +146,16 @@ async def process_prescription(
 )
 async def extract_prescription(
     payload: ExtractRequest,
-    db: Session = Depends(get_db),
 ) -> PrescriptionExtractionOut:
     """
     Enervara's RX_PROCESSING_PROVIDER=http contract: POST {RX_PROCESSING_API_URL}/extract
     with a JSON body naming a short-lived document_url (not file bytes).
-    Reuses the exact same OCR + parse_medicines() pipeline /process uses —
-    only the input (download instead of multipart) and output shape
-    (PrescriptionExtraction instead of PrescriptionProcessResponse) differ.
-    Any failure here is surfaced as a non-2xx response; Enervara's own
-    client treats any non-2xx uniformly as UPSTREAM_ERROR and never
-    surfaces our response body to its end users, so no failure mode needs
-    special-casing beyond returning the right status code.
+    Sends the downloaded image(s) directly to Gemini — no Postgres-catalog
+    cross-reference or fuzzy matching involved. Any failure here is
+    surfaced as a non-2xx response; Enervara's own client treats any
+    non-2xx uniformly as UPSTREAM_ERROR and never surfaces our response
+    body to its end users, so no failure mode needs special-casing beyond
+    returning the right status code.
     """
     logger.info(
         "[extract] request_id=%s prescription_id=%s mime_type=%s",
@@ -204,16 +172,8 @@ async def extract_prescription(
 
     start = time.perf_counter()
     try:
-        ocr_result = extract_text_from_images(pil_images)
-
-        medicines = parse_medicines(
-            ocr_result["medicine_text"], db, ocr_lines=ocr_result.get("medicine_ocr_lines")
-        )
-        if not medicines and ocr_result["full_text"]:
-            medicines = parse_medicines(ocr_result["full_text"], db, ocr_lines=ocr_result.get("all_ocr_lines"))
-
-        patient_info = _clean_patient_info(ocr_result, medicines)
-        extraction = build_extraction(patient_info, medicines)
+        result = gemini_extract_prescription(pil_images)
+        extraction = to_extraction_out(result)
 
         logger.info(
             "[extract] request_id=%s medications_found=%d elapsed_ms=%.1f",
@@ -223,15 +183,15 @@ async def extract_prescription(
 
     except HTTPException:
         raise
-    except OCRProviderError as exc:
+    except GeminiProviderError as exc:
         # See the matching handler in process_prescription() above — distinct
         # from a generic processing failure. Enervara's own client treats
         # any non-2xx uniformly (see httpProcessingService.ts), so this
         # doesn't change what Enervara's caller sees; it makes our own logs
-        # and any other direct caller of this endpoint able to tell "OCR
-        # provider down" apart from "something else broke."
-        logger.error("[extract] request_id=%s OCR provider unavailable: %s", payload.request_id, exc, exc_info=True)
-        raise HTTPException(503, "Prescription OCR service is temporarily unavailable. Please try again shortly.")
+        # and any other direct caller of this endpoint able to tell
+        # "extraction provider down" apart from "something else broke."
+        logger.error("[extract] request_id=%s extraction provider unavailable: %s", payload.request_id, exc, exc_info=True)
+        raise HTTPException(503, "Prescription extraction service is temporarily unavailable. Please try again shortly.")
     except Exception as exc:
         logger.error("[extract] request_id=%s processing failed: %s", payload.request_id, exc, exc_info=True)
         raise HTTPException(502, "Processing failed.")

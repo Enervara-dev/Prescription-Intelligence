@@ -1,17 +1,18 @@
 """
 tests/test_ocr_retry.py
 ---------------------------
-Tests for the bounded Vision-call retry and the distinct OCRProviderError
-signal (app/services/ocr_service.py), and its mapping to a 503 response
-distinct from every other kind of processing failure
-(app/api/v1/endpoints/prescriptions.py).
+Unit tests for the bounded Vision-call retry and the distinct
+OCRProviderError signal (app/services/ocr_service.py).
+
+This module is no longer called from the live request path (see
+app/api/v1/endpoints/prescriptions.py and app/services/gemini_extraction.py
+-- extraction now goes through Gemini) but is left in place, fully tested,
+in case it needs to be reverted to or run alongside Gemini later. The
+endpoint-level 503-mapping coverage this file used to include has a Gemini
+equivalent in tests/test_gemini_extraction.py.
 """
 
-import io
-
 import pytest
-from fastapi.testclient import TestClient
-from PIL import Image
 
 from app.services.ocr_service import OCRProviderError, _call_vision_with_retry
 
@@ -102,81 +103,3 @@ def test_permanent_config_errors_are_not_retried():
     finally:
         if old is not None:
             os.environ["GOOGLE_VISION_API_KEY"] = old
-
-
-# -- Endpoint-level mapping to a distinct 503 --------------------------------
-
-def _tiny_jpeg_bytes() -> bytes:
-    img = Image.new("RGB", (20, 20), color="white")
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG")
-    return buf.getvalue()
-
-
-@pytest.fixture()
-def client(db):
-    from app.db.session import get_db
-    from app.main import app
-
-    def _override_get_db():
-        yield db
-
-    app.dependency_overrides[get_db] = _override_get_db
-    with TestClient(app) as c:
-        yield c
-    app.dependency_overrides.clear()
-
-
-def test_process_returns_503_when_ocr_provider_unavailable(client, monkeypatch):
-    import app.api.v1.endpoints.prescriptions as prescriptions_module
-
-    def _raise_provider_error(images):
-        raise OCRProviderError("simulated: Vision unreachable after retries")
-
-    monkeypatch.setattr(prescriptions_module, "extract_text_from_images", _raise_provider_error)
-
-    resp = client.post(
-        "/api/v1/prescriptions/process",
-        files={"file": ("prescription.jpg", _tiny_jpeg_bytes(), "image/jpeg")},
-    )
-    assert resp.status_code == 503
-    assert "temporarily unavailable" in resp.json()["detail"].lower()
-
-
-def test_process_returns_500_for_unrelated_failures_not_503(client, monkeypatch):
-    """A bug elsewhere in processing must NOT be reported as an OCR-provider
-    problem -- only OCRProviderError maps to 503."""
-    import app.api.v1.endpoints.prescriptions as prescriptions_module
-
-    def _raise_something_else(images):
-        raise RuntimeError("unrelated internal bug")
-
-    monkeypatch.setattr(prescriptions_module, "extract_text_from_images", _raise_something_else)
-
-    resp = client.post(
-        "/api/v1/prescriptions/process",
-        files={"file": ("prescription.jpg", _tiny_jpeg_bytes(), "image/jpeg")},
-    )
-    assert resp.status_code == 500
-
-
-def test_extract_returns_503_when_ocr_provider_unavailable(client, monkeypatch):
-    import app.api.v1.endpoints.prescriptions as prescriptions_module
-
-    monkeypatch.setattr(prescriptions_module, "download_document", lambda url, timeout: b"fake-bytes")
-    monkeypatch.setattr(prescriptions_module, "file_bytes_to_pil_images", lambda content, mime: [object()])
-
-    def _raise_provider_error(images):
-        raise OCRProviderError("simulated: Vision unreachable after retries")
-
-    monkeypatch.setattr(prescriptions_module, "extract_text_from_images", _raise_provider_error)
-
-    resp = client.post(
-        "/api/v1/prescriptions/extract",
-        json={
-            "prescription_id": "rx-1", "user_id": "u-1",
-            "document_url": "https://storage.example.com/doc.jpg",
-            "mime_type": "image/jpeg", "file_name": "doc.jpg", "request_id": "req-1",
-        },
-    )
-    assert resp.status_code == 503

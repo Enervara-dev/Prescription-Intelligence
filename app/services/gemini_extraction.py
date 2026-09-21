@@ -1,0 +1,307 @@
+"""
+services/gemini_extraction.py
+---------------------------------
+LLM-based prescription extraction using Google's Gemini API. Replaces the
+Vision-OCR + Postgres-catalog-matching pipeline in the live request path
+(see app/api/v1/endpoints/prescriptions.py) -- Gemini reads the prescription
+image(s) directly and returns already-structured medicine data. There is no
+catalog cross-reference, fuzzy matching, or confidence-gating against a
+known-medicines table involved at all: Gemini's own extraction is the final
+answer, per explicit instruction.
+
+The catalog-matching code this replaces (app/services/medicine_resolver.py,
+app/services/extraction/__init__.py, app/services/ocr_service.py,
+app/services/enervara_extraction_adapter.py) is left in place, fully tested,
+and importable -- just no longer called from the request path. See those
+modules if this needs to be reverted or run alongside Gemini later.
+
+Output is mapped directly into this service's EXISTING response schemas
+(app/schemas/extract.py, app/schemas/prescription.py), so neither Enervara's
+/extract contract nor this service's own /process response shape changes --
+only how the data inside them gets produced.
+"""
+
+import io
+import logging
+import re
+import time
+from typing import List, Optional
+
+from google import genai
+from google.genai import types
+from PIL import Image
+from pydantic import BaseModel, Field
+
+from app.core.config import settings
+from app.schemas.extract import MedicationOut, PrescriptionExtractionOut, PrescriptionMetadataOut
+
+logger = logging.getLogger(__name__)
+
+# Bounded retry for the Gemini call itself -- covers a transient network
+# blip or a momentary provider hiccup, not a permanent misconfiguration.
+_MAX_GEMINI_ATTEMPTS = 3
+_GEMINI_RETRY_BACKOFF_SECONDS = (1.0, 2.0)  # delay before attempt 2 and attempt 3
+
+
+class GeminiProviderError(Exception):
+    """
+    Raised when Gemini could not be reached/used after retries were
+    exhausted, or returned a response that couldn't be parsed as valid
+    structured output. Distinct from:
+      - a successful call that simply found no medicines on the page (not
+        an error -- an empty `medications` list), and
+      - a permanent configuration problem (missing API key), which is
+        never retried and raises EnvironmentError immediately.
+    Callers (see app/api/v1/endpoints/prescriptions.py) catch this
+    specifically to return a distinct "extraction service unavailable, try
+    again" response instead of a generic failure message -- mirrors the
+    OCRProviderError pattern this replaces in the request path (see
+    app/services/ocr_service.py, kept for reference/rollback).
+    """
+
+
+# ---------------------------------------------------------------------------
+# Gemini-facing structured output schema. Deliberately a separate set of
+# models from schemas/extract.py's wire contract (MedicationOut etc.) -- the
+# prompt/response shape should be free to evolve independently of the wire
+# contract's stability guarantees; _to_extraction_out()/_to_process_medicines()
+# below do the mapping between the two.
+# ---------------------------------------------------------------------------
+
+class _GeminiMedication(BaseModel):
+    name: str = Field(description="The medicine's name exactly as printed or written on the label.")
+    generic_name: Optional[str] = Field(
+        default=None,
+        description="Generic/INN name, ONLY if explicitly printed (e.g. on a composition line) -- never guessed from the brand name.",
+    )
+    strength: Optional[str] = Field(default=None, description="e.g. '650mg', '500mg/5ml' -- exactly as stated.")
+    form: Optional[str] = Field(
+        default=None,
+        description="One of TABLET, CAPSULE, SYRUP, INJECTION, DROPS, CREAM, OINTMENT, GEL, SPRAY, SUSPENSION, OTHER -- only if clearly stated or unambiguous from context (e.g. 'TAB.' prefix).",
+    )
+    route: Optional[str] = Field(
+        default=None,
+        description="One of ORAL, TOPICAL, INJECTION, INHALED, OPHTHALMIC, NASAL, OTHER -- only if clearly stated or unambiguous.",
+    )
+    dosage: Optional[str] = Field(
+        default=None,
+        description="How much to take PER ADMINISTRATION, e.g. '1 tablet'. This is NOT a total quantity to dispense -- a 'Total: 8 Tab' style note is a total, not a dosage; leave this null if only a total is stated.",
+    )
+    frequency: Optional[str] = Field(
+        default=None, description="How often, e.g. 'Twice Daily', '1-0-1', 'Once at night'. If both a morning and a night dose are stated, say so explicitly (e.g. 'Twice Daily (Morning, Night)'), don't just report one of them.",
+    )
+    timing: Optional[str] = Field(default=None, description="Relative to meals/time of day, e.g. 'After Food', 'Before Food', 'Bedtime' -- distinct from frequency.")
+    duration_text: Optional[str] = Field(
+        default=None,
+        description="e.g. '5 days', '2 weeks' -- only from an explicit unit (days/weeks/months) in the text. A bare number with no unit (e.g. a quantity in parentheses) is NOT a duration.",
+    )
+    duration_days: Optional[int] = Field(default=None, description="duration_text converted to a day count, only when unambiguous.")
+    instructions: Optional[str] = Field(default=None, description="Any other explicit instruction specific to this medicine.")
+    common_use: Optional[str] = Field(
+        default=None,
+        description="A short, general, well-known reason this TYPE of medicine is commonly used (e.g. 'commonly used to reduce fever') -- only for genuinely well-established, widely-known medicines; null otherwise. Never a clinical judgement about this specific patient's case.",
+    )
+    confidence: float = Field(description="Your own confidence, 0.0-1.0, that you read THIS MEDICINE'S NAME correctly from the image -- not how common or plausible the name is.")
+
+
+class _GeminiMetadata(BaseModel):
+    prescriber_name: Optional[str] = None
+    prescriber_registration: Optional[str] = None
+    clinic_name: Optional[str] = None
+    patient_name: Optional[str] = None
+    indication_notes: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class GeminiExtraction(BaseModel):
+    prescribed_date: Optional[str] = Field(default=None, description="ISO 8601 date (YYYY-MM-DD) if a prescription date is visible, else null.")
+    metadata: _GeminiMetadata = Field(default_factory=_GeminiMetadata)
+    medications: List[_GeminiMedication] = Field(default_factory=list)
+    full_text: str = Field(description="A plain-text transcription of everything legible on the page(s) -- for audit/debug purposes, not further parsed.")
+
+
+_PROMPT = """You are reading a photograph or scan of a medical prescription. Extract exactly what is printed or written -- never invent, guess, or infer information that is not actually present on the page.
+
+Rules:
+- If a field is not clearly legible or not present, leave it null. Do not guess a plausible-looking value, and do not substitute a different, more "recognizable" medicine name for what is actually printed.
+- "dosage" means how much to take PER ADMINISTRATION (e.g. "1 tablet"). It is NOT a total quantity to dispense -- "Tot: 8 Tab" or "Total: 16 Tab" states a total across the whole course, not a per-dose amount; leave dosage null in that case unless a genuine per-dose amount is stated separately.
+- "duration_text" must come from an explicit unit (days/weeks/months) in the text. Do not treat a bare number (e.g. a quantity written in parentheses with no unit) as a duration.
+- List every distinct medicine on the page as a separate entry, even across multiple pages or a multi-page document, even if handwriting or print quality makes you uncertain -- report your actual confidence honestly instead of omitting an uncertain entry or inflating its confidence.
+- confidence must reflect how sure YOU are that you read the name correctly, not how common or plausible the medicine name is as a real drug.
+- Also provide a plain-text transcription of everything legible on the page(s) in `full_text`.
+"""
+
+
+def _require_api_key() -> str:
+    key = settings.GEMINI_API_KEY
+    if not key:
+        raise EnvironmentError(
+            "Gemini_API_KEY is not set. Add it to the project root .env as: Gemini_API_KEY=your_key_here"
+        )
+    return key
+
+
+def _pil_images_to_parts(images: List[Image.Image]) -> List[types.Part]:
+    parts = []
+    for img in images:
+        rgb = img.convert("RGB") if img.mode != "RGB" else img
+        buf = io.BytesIO()
+        rgb.save(buf, format="JPEG", quality=90)
+        parts.append(types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg"))
+    return parts
+
+
+def _call_gemini_with_retry(images: List[Image.Image]) -> GeminiExtraction:
+    """
+    Calls Gemini with a small bounded retry for transient failures (network
+    blip, momentary provider error, or a response that failed to parse as
+    the requested structured schema). Raises GeminiProviderError once
+    attempts are exhausted -- never surfaced to an external caller (see
+    prescriptions.py), which only gets a generic "temporarily unavailable"
+    message.
+    """
+    api_key = _require_api_key()  # permanent config error -- raises immediately, never retried
+    parts = _pil_images_to_parts(images)
+    parts.append(_PROMPT)
+
+    config = types.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_schema=GeminiExtraction,
+    )
+
+    last_exc: Optional[Exception] = None
+    for attempt in range(_MAX_GEMINI_ATTEMPTS):
+        try:
+            client = genai.Client(api_key=api_key)
+            response = client.models.generate_content(
+                model=settings.GEMINI_MODEL,
+                contents=parts,
+                config=config,
+            )
+            parsed = response.parsed
+            if parsed is None or not isinstance(parsed, GeminiExtraction):
+                raise ValueError("Gemini response did not include valid structured output")
+            return parsed
+        except Exception as exc:  # noqa: BLE001 -- deliberately broad: network/auth/parse errors all count
+            last_exc = exc
+            if attempt < _MAX_GEMINI_ATTEMPTS - 1:
+                logger.warning(
+                    "[gemini] extraction call failed (attempt %d/%d), retrying: %s",
+                    attempt + 1, _MAX_GEMINI_ATTEMPTS, exc,
+                )
+                time.sleep(_GEMINI_RETRY_BACKOFF_SECONDS[attempt])
+
+    raise GeminiProviderError(
+        f"Gemini extraction unavailable after {_MAX_GEMINI_ATTEMPTS} attempts: {last_exc}"
+    ) from last_exc
+
+
+def extract_prescription(images: List[Image.Image]) -> GeminiExtraction:
+    """
+    images: PIL.Image pages already decoded from the uploaded file/PDF (see
+    app/utils.py). All pages are sent in one request so Gemini can reason
+    about a multi-page prescription holistically, rather than page-by-page.
+    """
+    return _call_gemini_with_retry(images)
+
+
+# ---------------------------------------------------------------------------
+# Mapping into this service's existing, unchanged response contracts.
+# ---------------------------------------------------------------------------
+
+_DURATION_DAYS_RE = re.compile(r"(\d+)\s*day", re.IGNORECASE)
+
+
+def _derive_duration_days(duration_text: Optional[str], gemini_value: Optional[int]) -> Optional[int]:
+    """Prefers a deterministic regex derivation from duration_text (same
+    logic the previous adapter used) over trusting Gemini's own arithmetic,
+    when duration_text explicitly says "N day(s)" -- falls back to
+    Gemini's value for week/month-stated durations this regex doesn't cover."""
+    if duration_text:
+        m = _DURATION_DAYS_RE.search(duration_text)
+        if m:
+            return int(m.group(1))
+    return gemini_value
+
+
+def to_extraction_out(result: GeminiExtraction) -> PrescriptionExtractionOut:
+    """Maps to Enervara's /extract contract -- unchanged field names/shape."""
+    medications = [
+        MedicationOut(
+            name=med.name,
+            generic_name=med.generic_name,
+            strength=med.strength,
+            form=med.form.upper() if med.form else None,
+            route=med.route.upper() if med.route else None,
+            dosage=med.dosage,
+            frequency=med.frequency,
+            timing=med.timing,
+            duration_text=med.duration_text,
+            duration_days=_derive_duration_days(med.duration_text, med.duration_days),
+            instructions=med.instructions,
+            common_use=med.common_use,
+            confidence=med.confidence,
+        )
+        for med in result.medications
+    ]
+    return PrescriptionExtractionOut(
+        prescribed_date=result.prescribed_date,
+        metadata=PrescriptionMetadataOut(
+            prescriber_name=result.metadata.prescriber_name,
+            prescriber_registration=result.metadata.prescriber_registration,
+            clinic_name=result.metadata.clinic_name,
+            patient_name=result.metadata.patient_name,
+            indication_notes=result.metadata.indication_notes,
+            notes=result.metadata.notes,
+        ),
+        medications=medications,
+        suggested_speciality_slug=None,
+        suggested_speciality_reason=None,
+    )
+
+
+def to_process_medicines(result: GeminiExtraction) -> List[dict]:
+    """
+    Maps to this service's own /process response shape (schemas/prescription.py
+    Medicine model) -- back-compat field names unchanged, but there is no
+    catalog match behind any of these anymore: id/source/match_type/
+    brand_name/manufacturer reflect that honestly rather than implying a
+    catalog cross-reference that no longer happens.
+    """
+    return [
+        {
+            "name": med.name,
+            "confidence": round(med.confidence * 100.0, 1),
+            "dosage": med.dosage or "N/A",
+            "frequency": med.frequency or "N/A",
+            "duration": med.duration_text or "N/A",
+            "raw_line": None,
+            "id": None,
+            "generic_name": med.generic_name,
+            "brand_name": None,
+            "strength": med.strength,
+            "dosage_form": med.form.lower() if med.form else None,
+            "route": med.route.lower() if med.route else None,
+            "manufacturer": None,
+            "match_type": "LLM_EXTRACTED",
+            "source": "gemini",
+        }
+        for med in result.medications
+    ]
+
+
+def to_patient_info_text(result: GeminiExtraction) -> str:
+    meta = result.metadata
+    lines = [
+        v
+        for v in (
+            f"Dr. {meta.prescriber_name}" if meta.prescriber_name else None,
+            f"Reg No: {meta.prescriber_registration}" if meta.prescriber_registration else None,
+            meta.clinic_name,
+            f"Patient: {meta.patient_name}" if meta.patient_name else None,
+            meta.indication_notes,
+            meta.notes,
+        )
+        if v
+    ]
+    return "\n".join(lines) if lines else "Patient details not detected clearly."

@@ -1,11 +1,12 @@
 """
 tests/test_api.py
 --------------------
-HTTP-level tests for the prescription-processing API: request validation,
-status codes, error handling, and the full response contract. The Google
-Vision call itself is monkeypatched for these (deterministic, no external
-cost/credentials) — see test_real_vision_ocr.py for the credential-backed
-end-to-end OCR test.
+HTTP-level tests for POST /api/v1/prescriptions/process: request
+validation, status codes, error handling, and the response contract.
+Gemini extraction (app/services/gemini_extraction.py) is monkeypatched for
+determinism, no external cost/credentials, and no live-API flakiness —
+these test the ENDPOINT's contract (auth, validation, error mapping,
+response shape), not Gemini's actual extraction quality.
 """
 
 import io
@@ -14,7 +15,12 @@ import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 
-from app.repositories import medicine_repository as repo
+from app.services.gemini_extraction import (
+    GeminiExtraction,
+    GeminiProviderError,
+    _GeminiMedication,
+    _GeminiMetadata,
+)
 
 
 def _tiny_jpeg_bytes() -> bytes:
@@ -47,6 +53,10 @@ def client(db):
     with TestClient(app) as c:
         yield c
     app.dependency_overrides.clear()
+
+
+def _stub_gemini(monkeypatch, prescriptions_module, result: GeminiExtraction):
+    monkeypatch.setattr(prescriptions_module, "gemini_extract_prescription", lambda images: result)
 
 
 def test_health_endpoint(client):
@@ -118,7 +128,7 @@ def test_internal_error_never_leaks_exception_detail_to_caller(client, monkeypat
     def _boom(images):
         raise RuntimeError("SECRET internal detail: db password=hunter2 host=internal-db.local")
 
-    monkeypatch.setattr(prescriptions_module, "extract_text_from_images", _boom)
+    monkeypatch.setattr(prescriptions_module, "gemini_extract_prescription", _boom)
 
     resp = client.post(
         "/api/v1/prescriptions/process",
@@ -131,30 +141,21 @@ def test_internal_error_never_leaks_exception_detail_to_caller(client, monkeypat
     assert "SECRET" not in body["detail"]
 
 
-def test_medicine_successfully_matched_end_to_end(client, db, monkeypatch):
+def test_medicine_extracted_end_to_end(client, monkeypatch):
     import app.api.v1.endpoints.prescriptions as prescriptions_module
 
-    # Seed one medicine and stub OCR to return a deterministic line for it.
-    repo.upsert_medicine(db, {
-        "external_id": "legacy:paracetamol",
-        "generic_name": "Paracetamol",
-        "brand_name": "Dolo 650",
-        "aliases": ["Dolo", "Crocin", "Calpol"],
-        "source": "legacy_manual",
-    })
-    db.commit()
-
-    def _fake_ocr(images):
-        text = "Tab Dolo 650 1-0-1 x 5 days"
-        return {
-            "patient_info": "",
-            "medicine_text": text,
-            "full_text": text,
-            "word_count": 5,
-            "oriented_images": images,
-        }
-
-    monkeypatch.setattr(prescriptions_module, "extract_text_from_images", _fake_ocr)
+    result = GeminiExtraction(
+        metadata=_GeminiMetadata(prescriber_name="Ramesh Kumar"),
+        medications=[
+            _GeminiMedication(
+                name="Dolo 650", generic_name="Paracetamol", strength="650mg",
+                frequency="1-0-1 (M-A-N)", duration_text="5 days", duration_days=5,
+                confidence=0.95,
+            )
+        ],
+        full_text="Tab Dolo 650 1-0-1 x 5 days",
+    )
+    _stub_gemini(monkeypatch, prescriptions_module, result)
 
     resp = client.post(
         "/api/v1/prescriptions/process",
@@ -166,29 +167,17 @@ def test_medicine_successfully_matched_end_to_end(client, db, monkeypatch):
     assert len(body["medicines"]) == 1
     med = body["medicines"][0]
     assert med["name"] == "Dolo 650"
-    # parse_medicines is now backed by medicine_resolver.resolve() (richer
-    # UPPER_SNAKE match_type vocabulary than the old medicine_matching
-    # lowercase one). The pipeline looks ahead to combine "Dolo"+"650" before
-    # trying "Dolo" alone, so this resolves via the full brand string
-    # directly (EXACT_BRAND) rather than needing the bare "dolo" alias.
-    assert med["match_type"] == "EXACT_BRAND"
+    assert med["match_type"] == "LLM_EXTRACTED"
+    assert med["source"] == "gemini"
     assert med["duration"] == "5 days"
+    assert med["confidence"] == 95.0  # Gemini's 0-1 scale converted to this API's 0-100
 
 
 def test_medicine_not_found_returns_empty_list_not_error(client, monkeypatch):
     import app.api.v1.endpoints.prescriptions as prescriptions_module
 
-    def _fake_ocr(images):
-        text = "Completelyunknownxyzabc 1-0-1"
-        return {
-            "patient_info": "",
-            "medicine_text": text,
-            "full_text": text,
-            "word_count": 2,
-            "oriented_images": images,
-        }
-
-    monkeypatch.setattr(prescriptions_module, "extract_text_from_images", _fake_ocr)
+    result = GeminiExtraction(full_text="Completely illegible / no medicines found")
+    _stub_gemini(monkeypatch, prescriptions_module, result)
 
     resp = client.post(
         "/api/v1/prescriptions/process",
@@ -200,24 +189,17 @@ def test_medicine_not_found_returns_empty_list_not_error(client, monkeypatch):
     assert body["medicines"] == []
 
 
-def test_multiple_medicines_all_returned(client, db, monkeypatch):
+def test_multiple_medicines_all_returned(client, monkeypatch):
     import app.api.v1.endpoints.prescriptions as prescriptions_module
 
-    repo.upsert_medicine(db, {"external_id": "legacy:paracetamol", "generic_name": "Paracetamol", "source": "legacy_manual"})
-    repo.upsert_medicine(db, {"external_id": "legacy:amoxicillin", "generic_name": "Amoxicillin", "source": "legacy_manual"})
-    db.commit()
-
-    def _fake_ocr(images):
-        text = "Tab Paracetamol 500mg OD 5 days\nTab Amoxicillin 500mg BD 7 days"
-        return {
-            "patient_info": "",
-            "medicine_text": text,
-            "full_text": text,
-            "word_count": 10,
-            "oriented_images": images,
-        }
-
-    monkeypatch.setattr(prescriptions_module, "extract_text_from_images", _fake_ocr)
+    result = GeminiExtraction(
+        medications=[
+            _GeminiMedication(name="Paracetamol", frequency="Once Daily", duration_text="5 days", confidence=0.9),
+            _GeminiMedication(name="Amoxicillin", frequency="Twice Daily", duration_text="7 days", confidence=0.85),
+        ],
+        full_text="Tab Paracetamol 500mg OD 5 days\nTab Amoxicillin 500mg BD 7 days",
+    )
+    _stub_gemini(monkeypatch, prescriptions_module, result)
 
     resp = client.post(
         "/api/v1/prescriptions/process",
@@ -228,31 +210,29 @@ def test_multiple_medicines_all_returned(client, db, monkeypatch):
     assert names == {"Paracetamol", "Amoxicillin"}
 
 
-def test_malformed_ocr_result_missing_keys_is_500_not_unhandled_crash(client, monkeypatch):
+def test_extraction_provider_unavailable_is_503(client, monkeypatch):
     import app.api.v1.endpoints.prescriptions as prescriptions_module
 
-    def _malformed_ocr(images):
-        return {}  # missing every expected key
+    def _fail(images):
+        raise GeminiProviderError("Gemini unreachable after retries")
 
-    monkeypatch.setattr(prescriptions_module, "extract_text_from_images", _malformed_ocr)
+    monkeypatch.setattr(prescriptions_module, "gemini_extract_prescription", _fail)
 
     resp = client.post(
         "/api/v1/prescriptions/process",
         files={"file": ("prescription.jpg", _tiny_jpeg_bytes(), "image/jpeg")},
     )
-    # Must fail as a clean, structured 500 — not an unhandled server crash
-    # that closes the connection.
-    assert resp.status_code == 500
-    assert "detail" in resp.json()
+    assert resp.status_code == 503
+    assert "temporarily unavailable" in resp.json()["detail"].lower()
 
 
-def test_ocr_failure_is_structured_500(client, monkeypatch):
+def test_unrelated_processing_failure_is_500_not_503(client, monkeypatch):
     import app.api.v1.endpoints.prescriptions as prescriptions_module
 
     def _fail(images):
-        raise Exception("Vision API quota exceeded")
+        raise Exception("some other unexpected error")
 
-    monkeypatch.setattr(prescriptions_module, "extract_text_from_images", _fail)
+    monkeypatch.setattr(prescriptions_module, "gemini_extract_prescription", _fail)
 
     resp = client.post(
         "/api/v1/prescriptions/process",

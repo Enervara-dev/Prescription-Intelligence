@@ -33,6 +33,18 @@ class Settings:
 
     GOOGLE_VISION_API_KEY: str = os.environ.get("GOOGLE_VISION_API_KEY", "").strip()
 
+    # --- Gemini LLM-based prescription extraction (app/services/gemini_extraction.py) ---
+    # Replaces the Vision-OCR + Postgres-catalog-matching pipeline in the
+    # live request path (/process, /extract) -- Gemini reads the
+    # prescription image(s) directly and returns structured medicine data,
+    # with no catalog cross-reference involved. Env var name is
+    # deliberately "Gemini_API_KEY" (not the all-caps convention the rest
+    # of this file uses) to match what's actually set in the deployment
+    # environment -- env var names are case-sensitive; do not "fix" the
+    # casing here without also changing it wherever the value is set.
+    GEMINI_API_KEY: str = os.environ.get("Gemini_API_KEY", "").strip()
+    GEMINI_MODEL: str = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip()
+
     # --- Upload limits (unbounded uploads are a resource-exhaustion risk:
     # unlimited file size, or a pathological many-page PDF, both turn one
     # request into a large amount of memory/CPU/Vision-API work) ---
@@ -131,6 +143,18 @@ if not settings.RX_PROCESSING_API_KEY:
         "RX_PROCESSING_API_KEY is not set — POST /api/v1/prescriptions/extract "
         "is running WITHOUT service-to-service authentication. Set it before "
         "exposing this endpoint outside local development."
+    )
+
+if not settings.GEMINI_API_KEY:
+    # /process and /extract both depend on this now (see
+    # app/services/gemini_extraction.py) -- a soft warning here (not a
+    # startup failure), same pattern as GOOGLE_VISION_API_KEY: this module
+    # must stay importable with no key configured so pure-unit tests keep
+    # collecting cleanly. The actual endpoints fail clearly, at request
+    # time, if this is missing when they're called.
+    logger.warning(
+        "Gemini_API_KEY is not set. POST /api/v1/prescriptions/process and "
+        "/extract will fail at request time until it's configured."
     )
 
 if not settings.DATABASE_URL:

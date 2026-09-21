@@ -3,25 +3,26 @@ tests/test_pipeline_end_to_end.py
 -------------------------------------
 Full-pipeline test: synthetic OCR words -> geometry reconstruction -> OCR
 lines -> candidate extraction -> normalization -> medicine resolver ->
-dosage/frequency/duration -> final API response (through the real FastAPI
-app and Pydantic response models, not just the internal dict).
+dosage/frequency/duration (app/services/extraction.parse_medicines() and
+its dependencies -- app/services/ocr_geometry.py, medicine_resolver.py).
 
-Unlike every other test in this suite, this one builds its OCR input at the
-WORD level (OCRWord, with real bounding boxes and per-word confidence) and
-runs it through group_words_into_lines() for real, rather than starting
-from an already-flattened string. The point is to catch bugs where each
-stage passes its own unit tests but information is silently lost crossing
-the boundary between stages -- exactly the class of bug the OCR/matching
+This pipeline is no longer called from the live request path (see
+app/api/v1/endpoints/prescriptions.py and app/services/gemini_extraction.py
+-- extraction now goes through Gemini) but is left in place, fully tested,
+in case it needs to be reverted to or run alongside Gemini later.
+
+Unlike most tests in this suite, this one builds its OCR input at the WORD
+level (OCRWord, with real bounding boxes and per-word confidence) and runs
+it through group_words_into_lines() for real, rather than starting from an
+already-flattened string. The point is to catch bugs where each stage
+passes its own unit tests but information is silently lost crossing the
+boundary between stages -- exactly the class of bug the OCR/matching
 forensic audit found (confidence captured then discarded, spatial structure
 flattened too early, medicine-name-to-instruction association done
 globally instead of per-span).
 """
 
-import io
-
 import pytest
-from fastapi.testclient import TestClient
-from PIL import Image
 
 from app.repositories import medicine_repository as repo
 from app.services.extraction import parse_medicines
@@ -30,13 +31,6 @@ from app.services.ocr_geometry import OCRWord, group_words_into_lines
 
 def _word(text, x, y, width=None, height=20, confidence=0.95):
     return OCRWord(text=text, confidence=confidence, x=x, y=y, width=width or len(text) * 10, height=height)
-
-
-def _tiny_jpeg_bytes() -> bytes:
-    img = Image.new("RGB", (20, 20), color="white")
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG")
-    return buf.getvalue()
 
 
 @pytest.fixture()
@@ -137,58 +131,3 @@ def test_unresolved_medicine_stays_unresolved_through_full_chain(catalog):
     lines = group_words_into_lines(words)
     results = parse_medicines(lines[0].text, catalog, ocr_lines=lines)
     assert results == []
-
-
-def test_final_api_shape_compatible_with_structured_ocr_input(catalog, monkeypatch, two_row_words):
-    """
-    Runs the real FastAPI app (not just parse_medicines() in isolation) with
-    a stubbed OCR call returning structured OCRLine data, confirming the
-    Pydantic response model still validates and the existing API shape
-    (name/confidence/dosage/frequency/duration/strength/...) is unchanged.
-    """
-    from app.db.session import get_db
-    from app.main import app
-    import app.api.v1.endpoints.prescriptions as prescriptions_module
-
-    lines = group_words_into_lines(two_row_words)
-
-    def _fake_ocr(images):
-        text = "\n".join(l.text for l in lines)
-        return {
-            "patient_info": "",
-            "medicine_text": text,
-            "full_text": text,
-            "word_count": sum(len(l.words) for l in lines),
-            "oriented_images": images,
-            "medicine_ocr_lines": lines,
-            "patient_ocr_lines": [],
-            "all_ocr_lines": lines,
-        }
-
-    monkeypatch.setattr(prescriptions_module, "extract_text_from_images", _fake_ocr)
-
-    def _override_get_db():
-        yield catalog
-
-    app.dependency_overrides[get_db] = _override_get_db
-    try:
-        with TestClient(app) as client:
-            resp = client.post(
-                "/api/v1/prescriptions/process",
-                files={"file": ("prescription.jpg", _tiny_jpeg_bytes(), "image/jpeg")},
-            )
-    finally:
-        app.dependency_overrides.clear()
-
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["success"] is True
-    names = {m["name"] for m in body["medicines"]}
-    assert names == {"Dolo 650", "Pan 40"}
-    for med in body["medicines"]:
-        for key in (
-            "name", "confidence", "dosage", "frequency", "duration", "raw_line",
-            "id", "generic_name", "brand_name", "strength", "dosage_form",
-            "route", "manufacturer", "match_type", "source",
-        ):
-            assert key in med, key
