@@ -208,6 +208,41 @@ def test_to_patient_info_text_falls_back_when_nothing_found():
     assert to_patient_info_text(result) == "Patient details not detected clearly."
 
 
+def test_to_patient_info_text_never_doubles_dr_prefix():
+    """
+    Verified live-test bug: Gemini sometimes includes "Dr." in
+    prescriber_name despite being asked not to (e.g. "Dr. A. Sharma, M.D.")
+    -- must not become "Dr. Dr. A. Sharma, M.D." when this function adds its
+    own "Dr." prefix.
+    """
+    for name in ("Dr. A. Sharma, M.D.", "Dr A. Sharma", "A. Sharma"):
+        result = GeminiExtraction(metadata=_GeminiMetadata(prescriber_name=name), full_text="")
+        text = to_patient_info_text(result)
+        assert text.count("Dr") == 1, (name, text)
+
+
+# -- Prompt content: guards against silently losing the Indian-convention ---
+# -- guidance that fixed the verified "1-0-1" -> "Three Times Daily" misread -
+
+def test_prompt_explains_dash_pattern_convention():
+    prompt = gemini_extraction._PROMPT
+    assert "1-0-1" in prompt
+    assert "TWICE daily" in prompt or "Twice daily" in prompt.lower()
+    assert "not a count of doses" in prompt or "not a dose" in prompt
+
+
+def test_prompt_explains_total_quantity_is_not_dosage():
+    prompt = gemini_extraction._PROMPT
+    assert "Tot" in prompt
+    assert "not a per-administration amount" in prompt or "NOT a" in prompt
+
+
+def test_prompt_distinguishes_timing_from_frequency():
+    prompt = gemini_extraction._PROMPT
+    assert "before food" in prompt.lower() or "AC" in prompt
+    assert "timing" in prompt.lower()
+
+
 # -- Endpoint-level mapping to a distinct 503 --------------------------------
 
 def _tiny_jpeg_bytes() -> bytes:

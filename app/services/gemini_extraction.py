@@ -88,9 +88,23 @@ class _GeminiMedication(BaseModel):
         description="How much to take PER ADMINISTRATION, e.g. '1 tablet'. This is NOT a total quantity to dispense -- a 'Total: 8 Tab' style note is a total, not a dosage; leave this null if only a total is stated.",
     )
     frequency: Optional[str] = Field(
-        default=None, description="How often, e.g. 'Twice Daily', '1-0-1', 'Once at night'. If both a morning and a night dose are stated, say so explicitly (e.g. 'Twice Daily (Morning, Night)'), don't just report one of them.",
+        default=None,
+        description=(
+            "How often, described by WHICH TIMES OF DAY carry a nonzero dose -- e.g. "
+            "'Twice Daily (Morning, Night)', 'Thrice Daily (Morning, Afternoon, Night)', "
+            "'Once Daily (Night)'. For a dash/slash-separated dose pattern (e.g. '1-0-1', "
+            "'1-1-1', '0-0-1', '1/2-0-1'), count ONLY the nonzero positions -- '0' means "
+            "no dose at that time, it is not a third or fourth dose. See the Indian "
+            "prescription conventions section of your instructions for full worked "
+            "examples. Never report a meal-timing note (After Food, Before Food, etc.) "
+            "as the frequency -- that belongs in `timing`; still report the actual "
+            "frequency here even when a timing note is also present."
+        ),
     )
-    timing: Optional[str] = Field(default=None, description="Relative to meals/time of day, e.g. 'After Food', 'Before Food', 'Bedtime' -- distinct from frequency.")
+    timing: Optional[str] = Field(
+        default=None,
+        description="Relative to meals, e.g. 'After Food', 'Before Food', 'Empty Stomach', 'Bedtime' -- distinct from frequency (how many times a day) and never a substitute for it.",
+    )
     duration_text: Optional[str] = Field(
         default=None,
         description="e.g. '5 days', '2 weeks' -- only from an explicit unit (days/weeks/months) in the text. A bare number with no unit (e.g. a quantity in parentheses) is NOT a duration.",
@@ -105,7 +119,10 @@ class _GeminiMedication(BaseModel):
 
 
 class _GeminiMetadata(BaseModel):
-    prescriber_name: Optional[str] = None
+    prescriber_name: Optional[str] = Field(
+        default=None,
+        description="The prescribing doctor's name only, WITHOUT a leading 'Dr.'/'Dr'/'Doctor' title or trailing qualifications like 'M.D.' -- e.g. 'A. Sharma', not 'Dr. A. Sharma, M.D.'.",
+    )
     prescriber_registration: Optional[str] = None
     clinic_name: Optional[str] = None
     patient_name: Optional[str] = None
@@ -120,15 +137,64 @@ class GeminiExtraction(BaseModel):
     full_text: str = Field(description="A plain-text transcription of everything legible on the page(s) -- for audit/debug purposes, not further parsed.")
 
 
-_PROMPT = """You are reading a photograph or scan of a medical prescription. Extract exactly what is printed or written -- never invent, guess, or infer information that is not actually present on the page.
+_PROMPT = """You are reading a photograph or scan of a medical prescription, most likely from an Indian clinic or hospital. Extract exactly what is printed or written -- never invent, guess, or infer information that is not actually present on the page.
 
-Rules:
+General rules:
 - If a field is not clearly legible or not present, leave it null. Do not guess a plausible-looking value, and do not substitute a different, more "recognizable" medicine name for what is actually printed.
-- "dosage" means how much to take PER ADMINISTRATION (e.g. "1 tablet"). It is NOT a total quantity to dispense -- "Tot: 8 Tab" or "Total: 16 Tab" states a total across the whole course, not a per-dose amount; leave dosage null in that case unless a genuine per-dose amount is stated separately.
 - "duration_text" must come from an explicit unit (days/weeks/months) in the text. Do not treat a bare number (e.g. a quantity written in parentheses with no unit) as a duration.
 - List every distinct medicine on the page as a separate entry, even across multiple pages or a multi-page document, even if handwriting or print quality makes you uncertain -- report your actual confidence honestly instead of omitting an uncertain entry or inflating its confidence.
 - confidence must reflect how sure YOU are that you read the name correctly, not how common or plausible the medicine name is as a real drug.
 - Also provide a plain-text transcription of everything legible on the page(s) in `full_text`.
+
+Indian prescription conventions -- these are required, not optional, and are the most common source of misreading. Apply them carefully:
+
+1. Dash/slash-separated dose patterns (e.g. "1-0-1", "1-1-1", "0-0-1", "1/2-0-1") mean
+   Morning-Afternoon-Night (occasionally a 4th position for a bedtime dose), where EACH
+   NUMBER is the dose taken AT THAT SPECIFIC TIME -- it is a per-slot indicator, not a
+   count of doses to add up, and "0" is an explicit "skip this time", not a dose.
+   Count ONLY the nonzero positions when describing frequency, and name which times
+   those are:
+     "1-0-1"     -> one dose morning, none afternoon, one at night
+                    = TWICE daily (Morning, Night) -- NOT three times daily.
+     "1-1-1"     -> one dose at each of morning/afternoon/night
+                    = THREE TIMES daily (Morning, Afternoon, Night).
+     "0-0-1"     -> one dose at night only = ONCE daily (Night).
+     "1/2-0-1"   -> half a dose in the morning, none in the afternoon, one at night
+                    = TWICE daily (Morning, Night), with a half-dose in the morning --
+                    mention the half-dose in `dosage` or `instructions`, not just `frequency`.
+   A prescription stating separate lines like "1 Morning, 1 Night" (without dashes)
+   follows the exact same logic: two stated times = twice daily, report as
+   "Twice Daily (Morning, Night)".
+
+2. Common frequency abbreviations: OD = once daily, BD or BID = twice daily,
+   TDS or TID = thrice daily, QID = four times daily, HS = at bedtime/night,
+   SOS or PRN = when required/as needed, STAT = immediately (one-time), AC = before
+   meals, PC = after meals.
+
+3. "AC", "PC", "before food", "after food", "empty stomach", and similar phrases
+   describe TIMING RELATIVE TO A MEAL, not how many times a day the medicine is
+   taken. Put these in `timing`. Never let a timing note stand in for `frequency` --
+   if the text also states or implies an actual frequency (a dose pattern, an OD/BD/
+   TDS-style abbreviation, or explicit times of day), report that real frequency in
+   `frequency` even when a timing note is also present elsewhere in the same line.
+
+4. "Tab.", "Cap.", "Syp.", "Inj.", "Susp." prefixes immediately before a medicine
+   name indicate its dosage FORM (Tablet/Capsule/Syrup/Injection/Suspension) -- read
+   them into `form`, not as part of the medicine's name.
+
+5. A "Tot:" or "Total:" note (e.g. "Tot: 8 Tab", "Total: 16 Tab") states the TOTAL
+   QUANTITY to dispense for the entire course (roughly frequency x duration), NOT a
+   per-administration amount. Never report this number as `dosage` -- leave `dosage`
+   null unless a genuine per-dose amount ("1 tablet", "2 tsp") is stated separately
+   from any such total.
+
+6. A composition/ingredient line beneath a brand name (e.g. "DOXYLAMINE 10MG +
+   PYRIDOXINE 10MG + FOLIC ACID 2.5MG" printed under "TAB. VOMILAST") describes what
+   that ONE branded medicine contains -- it is not a list of separate medicines to
+   report individually; keep it associated with the brand name above it (e.g. as
+   `generic_name` or `instructions` on that one entry), unless the brand name itself
+   is illegible, in which case report what you can read honestly rather than
+   inventing a brand name to attach it to.
 """
 
 
@@ -290,12 +356,19 @@ def to_process_medicines(result: GeminiExtraction) -> List[dict]:
     ]
 
 
+_DR_PREFIX_RE = re.compile(r"^\s*dr\.?\s+", re.IGNORECASE)
+
+
 def to_patient_info_text(result: GeminiExtraction) -> str:
     meta = result.metadata
+    # Prompted to return the name without a "Dr." prefix (see
+    # _GeminiMetadata.prescriber_name) -- stripped defensively here too, so a
+    # prefix Gemini includes anyway never doubles up with the one added below.
+    prescriber_name = _DR_PREFIX_RE.sub("", meta.prescriber_name).strip() if meta.prescriber_name else None
     lines = [
         v
         for v in (
-            f"Dr. {meta.prescriber_name}" if meta.prescriber_name else None,
+            f"Dr. {prescriber_name}" if prescriber_name else None,
             f"Reg No: {meta.prescriber_registration}" if meta.prescriber_registration else None,
             meta.clinic_name,
             f"Patient: {meta.patient_name}" if meta.patient_name else None,
